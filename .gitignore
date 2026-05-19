@@ -1,0 +1,48 @@
+# Dependencies (npm-installed, not vendored sources)
+node_modules/
+
+# Electron build output
+dist/
+out/
+build/
+
+# Electron-builder artifacts
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.exe
+*.msi
+*.zip
+
+# Export scratch — frames and renders are not source
+frames/
+renders/
+*.mp4
+*.webm
+*.apng
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+electron-debug.log*
+
+# Local env / secrets
+.env
+.env.local
+
+# Crash dumps
+*.dmp
+crash-reports/

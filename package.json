@@ -1,0 +1,13 @@
+{
+  "name": "twist",
+  "version": "0.1.0",
+  "description": "2.5D vector puppet animation tool",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev":   "electron . --dev"
+  },
+  "devDependencies": {
+    "electron": "35.7.5"
+  }
+}

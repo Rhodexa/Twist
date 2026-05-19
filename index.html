@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'">
+    <title>Twist — untitled</title>
+    <link rel="stylesheet" href="styles/theme.css">
+    <link rel="stylesheet" href="styles/layout.css">
+</head>
+<body>
+    <div id="app">
+        <div id="panel-left"   class="panel" data-region="library"></div>
+        <div id="panel-center">
+            <div id="viewport-container">
+                <canvas id="viewport-canvas"></canvas>
+            </div>
+            <div id="timeline-panel" class="panel" data-region="timeline"></div>
+        </div>
+        <div id="panel-right"  class="panel" data-region="nodeeditor"></div>
+    </div>
+
+    <script type="module" src="src/app.js"></script>
+</body>
+</html>

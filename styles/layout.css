@@ -1,0 +1,64 @@
+/* Panel layout only. No colours hardcoded here — use var(--*) from theme.css. */
+
+#app {
+    display:               grid;
+    grid-template-columns: 220px 1fr 280px;
+    grid-template-rows:    100vh;
+    width:                 100vw;
+    height:                100vh;
+    gap:                   var(--gap);
+    background:            var(--border);   /* gap colour via background bleed */
+}
+
+/* ── Left panel (library / tools) ───────────────────────────────────────── */
+
+#panel-left {
+    background: var(--bg-panel);
+    overflow:   hidden;
+    min-width:  0;
+}
+
+/* ── Centre column (viewport + timeline) ────────────────────────────────── */
+
+#panel-center {
+    display:             grid;
+    grid-template-rows:  1fr 200px;
+    gap:                 var(--gap);
+    background:          var(--border);
+    min-width:           0;
+    min-height:          0;
+}
+
+#viewport-container {
+    position:   relative;
+    background: var(--bg-base);
+    overflow:   hidden;
+    min-height: 0;
+}
+
+#viewport-canvas {
+    position: absolute;
+    inset:    0;
+    display:  block;
+    /* width/height attributes are set by viewport.js to match physical pixels */
+}
+
+#timeline-panel {
+    background: var(--bg-panel);
+    overflow:   hidden;
+    min-height: 0;
+}
+
+/* ── Right panel (node editor / inspector) ───────────────────────────────── */
+
+#panel-right {
+    background: var(--bg-panel);
+    overflow:   hidden;
+    min-width:  0;
+}
+
+/* ── Generic panel style ─────────────────────────────────────────────────── */
+
+.panel {
+    background: var(--bg-panel);
+}
