@@ -1,18 +1,26 @@
-// GLSL source strings — inline for now, extract to files/ when they grow.
+// GLSL source strings — inline for now, extract to shaders/ when they grow.
 
-// Renders a 2D mesh in world space, transformed by the viewport's view matrix.
-// layout(location = 0) pins aPosition to attribute slot 0, matching the VAO
-// setup in viewport.js without needing a gl.getAttribLocation() call.
+// Passthrough vertex shader for screen-space geometry (passepartout ring, etc.)
+// Accepts pre-computed NDC coordinates — no matrix uniforms needed.
+const VERT_PASSE = /* glsl */`#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aPosition;
+void main() {
+    gl_Position = vec4(aPosition, 0.0, 1.0);
+}
+`
 
 const VERT_SCENE = /* glsl */`#version 300 es
 precision highp float;
 
 layout(location = 0) in vec2 aPosition;
 
-uniform mat3 uWorldToClip;
+uniform mat3 uViewMatrix;    // viewport: world → NDC  (once per frame)
+uniform mat3 uModelMatrix;   // instance: local → world (once per draw call)
 
 void main() {
-    vec3 clip   = uWorldToClip * vec3(aPosition, 1.0);
+    vec3 world  = uModelMatrix * vec3(aPosition, 1.0);
+    vec3 clip   = uViewMatrix  * world;
     gl_Position = vec4(clip.xy, 0.0, 1.0);
 }
 `
@@ -28,4 +36,4 @@ void main() {
 }
 `
 
-export { VERT_SCENE, FRAG_SCENE }
+export { VERT_SCENE, FRAG_SCENE, VERT_PASSE }

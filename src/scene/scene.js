@@ -1,25 +1,46 @@
-// Scene graph root. Everything visible in the world lives here.
-// Starting with just the camera — symbols, rigs, and timelines come later.
+// Scene graph root. Camera, symbol library, instances, and timeline live here.
 
 const scene = {
-    // The render camera defines WHAT region of world space gets exported.
-    // width/height are in world units, NOT pixels.
-    // output is the pixel resolution of the exported file.
-    // Keeping these independent means you can change resolution without
-    // moving or rescaling anything in the scene.
     camera: {
-        x:      0,      // world-space centre of the camera frame
-        y:      0,        
-        width:  1920,   // frame size in world units
+        x:      0,
+        y:      0,
+        width:  1920,
         height: 1080,
-        output: { w: 1920, h: 1080 }   // pixels in the exported file
+        output: { w: 1920, h: 1080 }
     },
 
-    // How many output pixels equal one world unit.
-    // At defaults: 1 world unit = 1 output pixel.
-    // Scale camera.width to zoom the camera out without touching scene geometry.
-    pixelsPerUnit() {
-        return this.camera.output.w / this.camera.width
+    // Symbol definitions — geometry shared across all instances.
+    // Vertices are flat x,y pairs in LOCAL space, centred at (0,0).
+    symbols: [
+        {
+            id:       'sym_0',
+            name:     'Test Shape',
+            color:    [0.42, 0.38, 0.72, 1.0],
+            vertices: new Float32Array([
+                -200, -150,    200, -150,    200,  150,
+                -200, -150,    200,  150,   -200,  150,
+            ])
+        }
+    ],
+
+    // Symbol instances — placed in the scene with a world-space transform.
+    // tracks: keyframe data on the scene timeline, keyed by property name.
+    // Each track is an array of { frame: Number, value: Number }, sorted by frame.
+    instances: [
+        {
+            id:        'inst_0',
+            symbolId:  'sym_0',
+            transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 },
+            tracks:    { x: [], y: [], rotation: [], scaleX: [], scaleY: [] }
+        }
+    ],
+
+    // Scene-level playback state.
+    timeline: {
+        currentFrame: 0,
+        duration:     120,
+        fps:          24,
+        playing:      false
     }
 }
 
