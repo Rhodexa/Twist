@@ -30,6 +30,10 @@ const scene = {
         {
             id:        'inst_0',
             symbolId:  'sym_0',
+            label:     'Test Shape',
+            parentId:  null,     // null = top-level; string = child of that instance
+            order:     0,        // render order within siblings (ascending = back-to-front)
+            rawMatrix: null,     // [a,b,c,d,tx,ty] Flash affine — null = use TRS transform
             transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1 },
             tracks:    { x: [], y: [], rotation: [], scaleX: [], scaleY: [] }
         }

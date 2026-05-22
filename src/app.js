@@ -4,12 +4,15 @@ import journal                    from './journal/journal.js'
 import scene                      from './scene/scene.js'
 import viewport                   from './ui/viewport.js'
 import { initTimelineUI, togglePlay } from './ui/timeline-ui.js'
+import { importFla }              from './fla/import.js'
+import { initOutliner }          from './ui/outliner.js'
 import                                 './input/input.js'   // registers Ctrl+Z / Y / S
 
 // ── Startup ───────────────────────────────────────────────────────────────
 
 viewport.init()
 initTimelineUI()
+initOutliner()
 
 // ── App-level keyboard shortcuts ──────────────────────────────────────────
 
@@ -20,6 +23,34 @@ document.addEventListener('keydown', e => {
         case 'f':
         case 'F':
             viewport.fitCamera()
+            break
+
+        // O — open a .fla file and dump its structure to the console (debug)
+        case 'o':
+        case 'O':
+            window.twist.openFla().then(result => {
+                if (!result) return
+                if (result.error) { console.error('[fla] open failed:', result.error); return }
+                console.log('[fla] path:', result.path)
+                console.log('[fla] entries (%d total):', result.entries.length, result.entries)
+                console.log('[fla] library symbols (%d):', result.libEntries.length, result.libEntries)
+                if (result.dom) {
+                    console.log('[fla] DOMDocument.xml (first 4000 chars):\n', result.dom.slice(0, 4000))
+                }
+                if (result.libXmls) {
+                    const keys = Object.keys(result.libXmls)
+                    console.log('[fla] library XMLs loaded:', keys.length)
+                    for (const k of keys.slice(0, 3)) {
+                        console.log(`\n[fla] ${k} (first 2000 chars):\n`, result.libXmls[k].slice(0, 2000))
+                    }
+                }
+            })
+            break
+
+        // I — import a .fla file into the scene
+        case 'i':
+        case 'I':
+            importFla()
             break
 
         // Enter — toggle play / pause

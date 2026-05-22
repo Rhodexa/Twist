@@ -8,4 +8,7 @@ contextBridge.exposeInMainWorld('twist', {
     // File I/O — stubs until save/load is wired in main.js
     saveFile: (filePath, data) => ipcRenderer.invoke('file:save', filePath, data),
     openFile: (filePath)       => ipcRenderer.invoke('file:open', filePath),
+
+    // FLA import
+    openFla: () => ipcRenderer.invoke('fla:open'),
 })

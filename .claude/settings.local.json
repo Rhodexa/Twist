@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"c:/Users/Celestia/Desktop/Rhode/FLA-RE\" -not -path \"*/node_modules/*\" -not -path \"*/__pycache__/*\" -not -path \"*/fla/*\" -not -path \"*/bon_bon_parts/*\" -not -path \"*/output/*\" | sort)",
+      "Read(//c/Users/Celestia/Desktop/Rhode/FLA-RE/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3)",
+      "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/*'\\)[:5]\\)\")",
+      "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/**/*.fla', recursive=True\\)[:5]\\)\")"
+    ]
+  }
+}

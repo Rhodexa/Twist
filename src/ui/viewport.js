@@ -21,6 +21,67 @@ overlay.style.cssText = 'position:absolute;inset:0;pointer-events:none;'
 container.appendChild(overlay)
 const ctx2d = overlay.getContext('2d')
 
+// ── Mat3 helpers (column-major Float32Array, matches GLSL mat3) ───────────
+
+const _IDENTITY_GL = new Float32Array([1,0,0, 0,1,0, 0,0,1])
+
+// Compose two column-major mat3s: result = A * B
+function composeMat3(A, B) {
+    const R = new Float32Array(9)
+    for (let c = 0; c < 3; c++)
+        for (let r = 0; r < 3; r++)
+            R[c*3+r] = A[0*3+r]*B[c*3+0] + A[1*3+r]*B[c*3+1] + A[2*3+r]*B[c*3+2]
+    return R
+}
+
+// Invert a 2D affine mat3 (column-major). Returns null if singular.
+function invertMat3(m) {
+    const a = m[0], b = m[1], c = m[3], d = m[4], tx = m[6], ty = m[7]
+    const det = a*d - b*c
+    if (Math.abs(det) < 1e-10) return null
+    return new Float32Array([
+        d/det, -b/det, 0,
+       -c/det,  a/det, 0,
+        (c*ty - d*tx)/det, (b*tx - a*ty)/det, 1,
+    ])
+}
+
+// Apply a column-major mat3 to a 2D point.
+function applyMat3(m, x, y) {
+    return { x: m[0]*x + m[3]*y + m[6], y: m[1]*x + m[4]*y + m[7] }
+}
+
+// Build a column-major GL mat3 from an instance's current transform.
+// If rawMatrix is set and no keyframes exist, use it directly.
+// Otherwise compute from TRS (handles the test rectangle and keyframed instances).
+function instanceLocalMat(inst, frame, dragging, dragId) {
+    if (inst.rawMatrix && !_hasKeyframes(inst)) {
+        const [a,b,c,d,tx,ty] = inst.rawMatrix
+        return new Float32Array([a,b,0, c,d,0, tx,ty,1])
+    }
+    const t = (dragging && inst.id === dragId)
+        ? inst.transform
+        : evaluateInstance(inst, frame)
+    return instanceToModelMatrix(t)
+}
+
+function _hasKeyframes(inst) {
+    return inst.tracks && Object.values(inst.tracks).some(tr => tr.length > 0)
+}
+
+// Walk up the parent chain and compose local matrices → world mat3.
+function getInstanceWorldMat(inst, frame) {
+    const chain = []
+    let cur = inst
+    while (cur) {
+        chain.unshift(instanceLocalMat(cur, frame, isDragging, dragInstanceId))
+        cur = cur.parentId ? scene.instances.find(i => i.id === cur.parentId) : null
+    }
+    let mat = _IDENTITY_GL.slice()
+    for (const m of chain) mat = composeMat3(mat, m)
+    return mat
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function cssVarToGL(varName) {
@@ -121,22 +182,40 @@ function worldToLocal(wx, wy, t) {
 }
 
 // AABB of a symbol's vertices in its own local space.
+// Supports both legacy {vertices} and new {submeshes} formats.
 function getSymbolLocalAABB(symbol) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-    for (let i = 0; i < symbol.vertices.length; i += 2) {
-        const x = symbol.vertices[i], y = symbol.vertices[i + 1]
-        if (x < minX) minX = x;  if (x > maxX) maxX = x
-        if (y < minY) minY = y;  if (y > maxY) maxY = y
+
+    function scan(verts) {
+        for (let i = 0; i < verts.length; i += 2) {
+            const x = verts[i], y = verts[i + 1]
+            if (x < minX) minX = x;  if (x > maxX) maxX = x
+            if (y < minY) minY = y;  if (y > maxY) maxY = y
+        }
     }
+
+    if (symbol.submeshes) {
+        for (const sm of symbol.submeshes) scan(sm.vertices)
+    } else if (symbol.vertices) {
+        scan(symbol.vertices)
+    }
+
     return { minX, minY, maxX, maxY }
 }
 
-// Point-in-AABB test in the instance's local space.
+// Point-in-AABB test using the instance's full world matrix.
+// Only tests instances without a parent (top-level); body-part selection
+// goes through the outliner.
 function hitTestInstance(wx, wy, instance) {
+    if (instance.parentId) return false    // only top-level instances are viewport-selectable
     const sym = scene.symbols.find(s => s.id === instance.symbolId)
     if (!sym) return false
-    const local = worldToLocal(wx, wy, instance.transform)
-    const aabb  = getSymbolLocalAABB(sym)
+    const aabb = getSymbolLocalAABB(sym)
+    if (aabb.minX === Infinity) return false
+    const worldMat = getInstanceWorldMat(instance, scene.timeline.currentFrame)
+    const inv = invertMat3(worldMat)
+    if (!inv) return false
+    const local = applyMat3(inv, wx, wy)
     return local.x >= aabb.minX && local.x <= aabb.maxX
         && local.y >= aabb.minY && local.y <= aabb.maxY
 }
@@ -203,6 +282,7 @@ function _startTool(e) {
 
     if (hit) {
         selectedId       = hit.id
+        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
         isDragging       = true
         dragInstanceId   = hit.id
         dragStartWorld   = { x: wx, y: wy }
@@ -210,6 +290,7 @@ function _startTool(e) {
         canvas.setPointerCapture(e.pointerId)
     } else {
         selectedId = null
+        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
         isDragging = false
     }
 
@@ -304,12 +385,43 @@ const viewport = {
     get cssWidth()    { return cssW },
     get cssHeight()   { return cssH },
     get selectedId()  { return selectedId },
+    setSelected(id)   { selectedId = id; this.markDirty() },
 
     dirty:          true,
     _lastTimestamp: 0,
     _playAccum:     0,
 
     markDirty() { this.dirty = true },
+
+    // Build GL VAO(s) for a symbol by id. Safe to call after init() for new symbols.
+    buildSymbolVaos(symId) {
+        const sym = scene.symbols.find(s => s.id === symId)
+        if (!sym) return
+
+        function makeVao(vertices) {
+            const vao = gl.createVertexArray()
+            const vbo = gl.createBuffer()
+            gl.bindVertexArray(vao)
+            gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
+            gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW)
+            gl.enableVertexAttribArray(0)
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+            gl.bindVertexArray(null)
+            return { vao, vertexCount: vertices.length / 2 }
+        }
+
+        if (sym.submeshes) {
+            // Multi-fill symbol: one VAO per submesh, each with its own color
+            const submeshVaos = sym.submeshes.map(sm => ({
+                color: new Float32Array(sm.color),
+                ...makeVao(sm.vertices),
+            }))
+            _symbolVaos.set(sym.id, { submeshes: submeshVaos })
+        } else if (sym.vertices) {
+            // Legacy single-mesh symbol
+            _symbolVaos.set(sym.id, makeVao(sym.vertices))
+        }
+    },
 
     _resize() {
         const dpr = window.devicePixelRatio || 1
@@ -355,22 +467,47 @@ const viewport = {
         gl.useProgram(_prog)
         gl.uniformMatrix3fv(_uniforms.viewMatrix, false, worldToClipMatrix())
 
-        for (const instance of scene.instances) {
-            const sym  = scene.symbols.find(s => s.id === instance.symbolId)
-            const mesh = _symbolVaos.get(instance.symbolId)
-            if (!sym || !mesh) continue
+        // Build children map sorted by order (ascending = back-to-front).
+        const childrenOf = new Map()
+        for (const inst of scene.instances) {
+            const pid = inst.parentId ?? null
+            if (!childrenOf.has(pid)) childrenOf.set(pid, [])
+            childrenOf.get(pid).push(inst)
+        }
+        for (const children of childrenOf.values())
+            children.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
 
-            // During drag: use live transform directly (skip keyframe evaluation)
-            const transform = (isDragging && instance.id === dragInstanceId)
-                ? instance.transform
-                : evaluateInstance(instance, scene.timeline.currentFrame)
+        const frame = scene.timeline.currentFrame
 
-            gl.uniformMatrix3fv(_uniforms.modelMatrix, false, instanceToModelMatrix(transform))
-            gl.uniform4fv(_uniforms.color, sym.color)
-            gl.bindVertexArray(mesh.vao)
-            gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount)
+        // DFS traversal: accumulate world matrix, draw each symbol's geometry,
+        // then recurse into children. This gives correct painter's-algorithm order.
+        const drawSubtree = (parentId, parentWorldMat) => {
+            for (const inst of (childrenOf.get(parentId) ?? [])) {
+                const localMat = instanceLocalMat(inst, frame, isDragging, dragInstanceId)
+                const worldMat = composeMat3(parentWorldMat, localMat)
+                const mesh     = _symbolVaos.get(inst.symbolId)
+
+                if (mesh) {
+                    gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+                    if (mesh.submeshes) {
+                        for (const sm of mesh.submeshes) {
+                            gl.uniform4fv(_uniforms.color, sm.color)
+                            gl.bindVertexArray(sm.vao)
+                            gl.drawArrays(gl.TRIANGLES, 0, sm.vertexCount)
+                        }
+                    } else {
+                        const sym = scene.symbols.find(s => s.id === inst.symbolId)
+                        if (sym) gl.uniform4fv(_uniforms.color, sym.color)
+                        gl.bindVertexArray(mesh.vao)
+                        gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount)
+                    }
+                }
+
+                drawSubtree(inst.id, worldMat)
+            }
         }
 
+        drawSubtree(null, _IDENTITY_GL)
         gl.bindVertexArray(null)
     },
 
@@ -428,18 +565,15 @@ const viewport = {
             const inst = scene.instances.find(i => i.id === selectedId)
             const sym  = inst && scene.symbols.find(s => s.id === inst.symbolId)
             if (inst && sym) {
-                const transform = (isDragging && inst.id === dragInstanceId)
-                    ? inst.transform
-                    : evaluateInstance(inst, scene.timeline.currentFrame)
-
-                const aabb = getSymbolLocalAABB(sym)
+                const worldMat = getInstanceWorldMat(inst, scene.timeline.currentFrame)
+                const aabb     = getSymbolLocalAABB(sym)
                 const corners = [
                     { x: aabb.minX, y: aabb.minY },
                     { x: aabb.maxX, y: aabb.minY },
                     { x: aabb.maxX, y: aabb.maxY },
                     { x: aabb.minX, y: aabb.maxY },
                 ].map(c => {
-                    const w = localToWorld(c.x, c.y, transform)
+                    const w = applyMat3(worldMat, c.x, c.y)
                     return worldToScreen(w.x, w.y)
                 })
 
@@ -485,18 +619,8 @@ const viewport = {
         gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
         gl.bindVertexArray(null)
 
-        // Build a VAO for each symbol definition
-        for (const sym of scene.symbols) {
-            const vao = gl.createVertexArray()
-            const vbo = gl.createBuffer()
-            gl.bindVertexArray(vao)
-            gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
-            gl.bufferData(gl.ARRAY_BUFFER, sym.vertices, gl.STATIC_DRAW)
-            gl.enableVertexAttribArray(0)
-            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
-            gl.bindVertexArray(null)
-            _symbolVaos.set(sym.id, { vao, vertexCount: sym.vertices.length / 2 })
-        }
+        // Build VAOs for all symbols in the initial scene
+        for (const sym of scene.symbols) this.buildSymbolVaos(sym.id)
 
         const observer = new ResizeObserver(() => { this._resize(); this.markDirty() })
         observer.observe(container)
