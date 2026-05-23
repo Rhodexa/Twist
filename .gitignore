@@ -1,6 +1,5 @@
 # Flare copy
-FLA-RE/fla
-FLA-RE/output
+FLA-RE
 
 # Dependencies (npm-installed, not vendored sources)
 node_modules/

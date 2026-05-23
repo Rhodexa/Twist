@@ -316,7 +316,6 @@ function collectSymbolRegions(name, symbolMap, frameNum, mat, visited, out) {
         const ltype = layer.getAttribute('layerType') ?? 'normal'
         // Skip non-rendered layer types. Mask layers skipped for now (no stencil yet).
         if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-        if (layer.getAttribute('visible') === 'false') continue
 
         const frame = activeFrame(layer, frameNum)
         if (!frame) continue
@@ -460,7 +459,6 @@ function collectDirectRegions(doc, frameNum) {
     for (const layer of Array.from(layersElem.children).reverse()) {
         const ltype = layer.getAttribute('layerType') ?? 'normal'
         if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-        if (layer.getAttribute('visible') === 'false') continue
         const frame = activeFrame(layer, frameNum)
         if (!frame) continue
         const elements = childByLocalName(frame, 'elements')
@@ -545,8 +543,7 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
             const layer = allLayers[i]
             const ltype = layer.getAttribute('layerType') ?? 'normal'
             if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-            if (layer.getAttribute('visible') === 'false') continue
-            const frame = activeFrame(layer, frameNum)
+            const frame = activeFrame(layer, fn)   // fn = this symbol's own frame, NOT the root's
             if (!frame) continue
             const elements = childByLocalName(frame, 'elements')
             if (!elements) continue
