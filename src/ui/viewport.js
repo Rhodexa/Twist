@@ -182,7 +182,7 @@ function worldToLocal(wx, wy, t) {
 }
 
 // AABB of a symbol's vertices in its own local space.
-// Supports both legacy {vertices} and new {submeshes} formats.
+// Handles FLA {meshes}, legacy {submeshes}, and bare {vertices}.
 function getSymbolLocalAABB(symbol) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
 
@@ -194,7 +194,9 @@ function getSymbolLocalAABB(symbol) {
         }
     }
 
-    if (symbol.submeshes) {
+    if (symbol.meshes) {
+        for (const m of symbol.meshes)    scan(m.vertices)
+    } else if (symbol.submeshes) {
         for (const sm of symbol.submeshes) scan(sm.vertices)
     } else if (symbol.vertices) {
         scan(symbol.vertices)
@@ -224,6 +226,15 @@ function hitTestInstance(wx, wy, instance) {
 // Not journaled — selection is editor state, not scene data.
 
 let selectedId = null
+
+// ── External tool state ───────────────────────────────────────────────────
+// Set by modal tools (transform-tool, etc.) to suppress built-in drag.
+
+let _externalToolActive = false
+
+// Overlay hooks — any module can push a fn(ctx2d, cssW, cssH) to draw
+// on top of the viewport's own overlay. Called after the built-in overlay.
+const _overlayHooks = []
 
 // ── Drag state ────────────────────────────────────────────────────────────
 
@@ -270,6 +281,7 @@ function _stopPan(e) {
 // ── Tool state (select / drag) ────────────────────────────────────────────
 
 function _startTool(e) {
+    if (_externalToolActive) return    // modal tool has control
     const rect = canvas.getBoundingClientRect()
     const wx   = (e.clientX - rect.left - cssW / 2 - view.x) / view.zoom
     const wy   = (e.clientY - rect.top  - cssH / 2 - view.y) / view.zoom
@@ -405,6 +417,29 @@ const viewport = {
     get cssHeight()   { return cssH },
     get selectedId()  { return selectedId },
     setSelected(id)   { selectedId = id; this.markDirty() },
+    setToolActive(v)  { _externalToolActive = v },
+    addOverlayHook(fn){ _overlayHooks.push(fn) },
+
+    // World-space origin (registration point) of an instance.
+    getWorldOrigin(instId) {
+        const inst = scene.instances.find(i => i.id === instId)
+        if (!inst) return null
+        const m = getInstanceWorldMat(inst, scene.timeline.currentFrame)
+        return { x: m[6], y: m[7] }
+    },
+
+    // Transform a world-space delta (direction, not position) into the local
+    // space of parentInstId. Used by the transform tool for child instances.
+    worldDeltaToLocal(parentInstId, wdx, wdy) {
+        const parent = scene.instances.find(i => i.id === parentInstId)
+        if (!parent) return { x: wdx, y: wdy }
+        const m   = getInstanceWorldMat(parent, scene.timeline.currentFrame)
+        const inv = invertMat3(m)
+        if (!inv) return { x: wdx, y: wdy }
+        const p0 = applyMat3(inv, 0,   0  )
+        const pd = applyMat3(inv, wdx, wdy)
+        return { x: pd.x - p0.x, y: pd.y - p0.y }
+    },
 
     dirty:          true,
     _lastTimestamp: 0,
@@ -618,7 +653,7 @@ const viewport = {
         const tl = worldToScreen(cam.x - cam.width  / 2, cam.y - cam.height / 2)
         const br = worldToScreen(cam.x + cam.width  / 2, cam.y + cam.height / 2)
         const fw = br.x - tl.x,  fh = br.y - tl.y
-        ctx2d.strokeStyle = 'rgba(255,255,255,0.18)'
+        ctx2d.strokeStyle = 'rgba(0, 0, 0, 0.73)'
         ctx2d.lineWidth   = 1
         ctx2d.strokeRect(Math.round(tl.x) + 0.5, Math.round(tl.y) + 0.5, Math.round(fw), Math.round(fh))
 
@@ -650,6 +685,8 @@ const viewport = {
         }
 
         ctx2d.restore()
+
+        for (const hook of _overlayHooks) hook(ctx2d, cssW, cssH)
     },
 
     _renderClear() {
@@ -718,38 +755,77 @@ const viewport = {
         gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
         gl.bindVertexArray(null)
 
-        // Checker controls widget
-        const checkerWidget = document.createElement('div')
-        checkerWidget.id = 'checker-widget'
-        checkerWidget.style.cssText = [
-            'position:absolute', 'bottom:12px', 'left:12px',
-            'display:flex', 'align-items:center', 'gap:8px',
-            'background:rgba(0,0,0,0.55)', 'border:1px solid rgba(255,255,255,0.08)',
-            'border-radius:6px', 'padding:5px 10px',
-            'font:11px/1 monospace', 'color:rgba(255,255,255,0.6)',
-            'user-select:none', 'pointer-events:all',
+        // ── Viewport header bar ───────────────────────────────────────────
+        const header = document.createElement('div')
+        header.id    = 'vp-header'
+        header.style.cssText = [
+            'position:absolute', 'top:0', 'left:0', 'right:0', 'height:28px',
+            'display:flex', 'align-items:center', 'justify-content:flex-end',
+            'padding:0 6px', 'gap:4px',
+            'background:rgba(18,18,22,0.72)',
+            'backdrop-filter:blur(6px)',
+            '-webkit-backdrop-filter:blur(6px)',
+            'border-bottom:1px solid rgba(255,255,255,0.07)',
+            'z-index:10', 'pointer-events:all', 'user-select:none',
+            'font:11px/1 var(--font-mono,monospace)', 'color:rgba(255,255,255,0.65)',
         ].join(';')
-        checkerWidget.innerHTML = `
-            <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
-                <input type="checkbox" id="ck-enable" ${checker.enabled ? 'checked' : ''}> BG
-            </label>
-            <label style="display:flex;align-items:center;gap:4px">
-                scale
-                <input type="range" id="ck-scale" min="8" max="64" step="4" value="${checker.scale}" style="width:60px">
-            </label>
-            <label style="display:flex;align-items:center;gap:4px">
-                opacity
-                <input type="range" id="ck-opacity" min="0" max="1" step="0.05" value="${checker.opacity}" style="width:60px">
-            </label>`
-        container.appendChild(checkerWidget)
 
-        document.getElementById('ck-enable').addEventListener('change', e => {
+        // Extras button + dropdown
+        const extrasBtn = document.createElement('button')
+        extrasBtn.textContent = 'Extras ▾'
+        extrasBtn.style.cssText = [
+            'background:rgba(255,255,255,0.06)', 'border:1px solid rgba(255,255,255,0.12)',
+            'color:rgba(255,255,255,0.7)', 'font:11px/1 var(--font-mono,monospace)',
+            'padding:3px 8px', 'border-radius:4px', 'cursor:pointer',
+        ].join(';')
+
+        const dropdown = document.createElement('div')
+        dropdown.style.cssText = [
+            'position:absolute', 'top:29px', 'right:6px',
+            'background:rgba(18,18,22,0.92)',
+            'border:1px solid rgba(255,255,255,0.1)',
+            'border-radius:6px', 'padding:10px 12px',
+            'display:none', 'flex-direction:column', 'gap:8px',
+            'z-index:20', 'min-width:190px',
+            'font:11px/1.6 var(--font-mono,monospace)', 'color:rgba(255,255,255,0.65)',
+        ].join(';')
+        dropdown.innerHTML = `
+            <div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+                        color:rgba(255,255,255,0.3);margin-bottom:2px">Background</div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="ck-enable" ${checker.enabled ? 'checked' : ''}>
+                Show checkerboard
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+                Scale
+                <input type="range" id="ck-scale" min="8" max="64" step="4"
+                       value="${checker.scale}" style="flex:1;accent-color:var(--accent,#a88)">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+                Opacity
+                <input type="range" id="ck-opacity" min="0" max="1" step="0.05"
+                       value="${checker.opacity}" style="flex:1;accent-color:var(--accent,#a88)">
+            </label>`
+
+        extrasBtn.addEventListener('click', e => {
+            e.stopPropagation()
+            const open = dropdown.style.display === 'flex'
+            dropdown.style.display = open ? 'none' : 'flex'
+        })
+        document.addEventListener('click', () => { dropdown.style.display = 'none' })
+        dropdown.addEventListener('click', e => e.stopPropagation())
+
+        header.appendChild(extrasBtn)
+        header.appendChild(dropdown)
+        container.appendChild(header)
+
+        dropdown.querySelector('#ck-enable').addEventListener('change', e => {
             checker.enabled = e.target.checked; this.markDirty()
         })
-        document.getElementById('ck-scale').addEventListener('input', e => {
+        dropdown.querySelector('#ck-scale').addEventListener('input', e => {
             checker.scale = parseFloat(e.target.value); this.markDirty()
         })
-        document.getElementById('ck-opacity').addEventListener('input', e => {
+        dropdown.querySelector('#ck-opacity').addEventListener('input', e => {
             checker.opacity = parseFloat(e.target.value); this.markDirty()
         })
 
