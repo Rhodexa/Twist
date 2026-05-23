@@ -3,7 +3,7 @@
 // and a tree of scene.instances mirroring the FLA symbol hierarchy.
 
 import { buildSymbolMap, findRoots, parseHierarchy } from './parser.js'
-import { tessellateRegions }                          from './tessellate.js'
+import { tessellateAll, extractEdgeContours } from './tessellate.js'
 import scene    from '../scene/scene.js'
 import viewport from '../ui/viewport.js'
 
@@ -47,18 +47,21 @@ async function importFla() {
 
     // ── Build scene.symbols ────────────────────────────────────────────────
     // One scene.symbol per unique FLA symbol name, geometry in LOCAL space.
-    const symIdMap = new Map()   // FLA symbol name → scene.symbol.id
+    const symIdMap = new Map()   // "FLA symbol name@@frameNum" → scene.symbol.id
 
-    for (const [name, regions] of symbolGeometry) {
-        const uid      = `fla_${++_importCounter}`
-        const submeshes = tessellateRegions(regions)
+    for (const [key, regions] of symbolGeometry) {
+        const name         = key.split('@@')[0]
+        const uid          = `fla_${++_importCounter}`
+        const meshes       = tessellateAll(regions)     // fills+strokes in paint order
+        const edgeContours = extractEdgeContours(regions)
         scene.symbols.push({
-            id:       uid,
+            id:   uid,
             name,
-            label:    name.split('/').pop().replace(/^~/, ''),
-            submeshes,   // empty [] for pure-composite symbols (no direct shapes)
+            label: name.split('/').pop().replace(/^~/, ''),
+            meshes,        // ordered fill+stroke triangles
+            edgeContours,  // wireframe overlay (debug)
         })
-        symIdMap.set(name, uid)
+        symIdMap.set(key, uid)
         viewport.buildSymbolVaos(uid)
     }
 
@@ -67,7 +70,7 @@ async function importFla() {
     const baseInst = scene.instances.length
 
     function flattenNode(node, parentInstId) {
-        const symId = symIdMap.get(node.symbolName)
+        const symId = symIdMap.get(`${node.symbolName}@@${node.frameNum ?? 0}`)
         if (!symId) return
 
         const instId = `inst_fla_${++_importCounter}`

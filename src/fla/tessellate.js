@@ -119,47 +119,166 @@ function stitchContours(segs) {
 
 // ── Earcut tessellation ────────────────────────────────────────────────────
 
+// Shoelace signed area. Positive = CW in screen space (Y-down) = outer.
+// Negative = CCW in screen space = hole. Earcut fixes winding internally.
+function signedArea(pts) {
+    let a = 0
+    const n = pts.length / 2
+    for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n
+        a += pts[i*2] * pts[j*2+1] - pts[j*2] * pts[i*2+1]
+    }
+    return a / 2
+}
+
+// Ray-cast point-in-polygon on a flat [x,y,...] array.
+function pointInPolygon(px, py, pts) {
+    let inside = false
+    const n = pts.length / 2
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = pts[i*2], yi = pts[i*2+1]
+        const xj = pts[j*2], yj = pts[j*2+1]
+        if ((yi > py) !== (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi)
+            inside = !inside
+    }
+    return inside
+}
+
 function tessellateContours(contours) {
     if (!contours.length) return null
 
-    // earcut: flat vertex array + hole start indices
-    const verts = []
-    const holes = []
-    for (let i = 0; i < contours.length; i++) {
-        if (i > 0) holes.push(verts.length / 2)
-        for (let j = 0; j < contours[i].length; j++) verts.push(contours[i][j])
+    // Single contour: trivial path, no nesting needed.
+    if (contours.length === 1) {
+        if (contours[0].length < 6) return null
+        const idx = earcut(contours[0], null, 2)
+        if (!idx.length) return null
+        const tris = new Float32Array(idx.length * 2)
+        for (let i = 0; i < idx.length; i++) {
+            tris[i*2]   = contours[0][idx[i]*2]
+            tris[i*2+1] = contours[0][idx[i]*2+1]
+        }
+        return tris
     }
 
-    const indices = earcut(verts, holes.length ? holes : null, 2)
-    if (!indices.length) return null
+    // Multiple contours: group into (outer + holes) clusters, then earcut each.
+    // Sort by absolute area descending so the largest contour is processed first.
+    const byArea = contours
+        .filter(c => c.length >= 6)
+        .map(pts => ({ pts, absArea: Math.abs(signedArea(pts)) }))
+        .sort((a, b) => b.absArea - a.absArea)
 
-    const tris = new Float32Array(indices.length * 2)
-    for (let i = 0; i < indices.length; i++) {
-        tris[i * 2]     = verts[indices[i] * 2]
-        tris[i * 2 + 1] = verts[indices[i] * 2 + 1]
+    const allTris = []
+    const used    = new Array(byArea.length).fill(false)
+
+    for (let i = 0; i < byArea.length; i++) {
+        if (used[i]) continue
+        used[i] = true
+        const outerPts = byArea[i].pts
+
+        // Any unused contour whose first vertex is inside this outer → hole.
+        const holes = []
+        for (let j = i + 1; j < byArea.length; j++) {
+            if (used[j]) continue
+            if (pointInPolygon(byArea[j].pts[0], byArea[j].pts[1], outerPts)) {
+                holes.push(byArea[j].pts)
+                used[j] = true
+            }
+        }
+
+        // Concatenate outer + holes for earcut, recording hole start indices.
+        const verts      = [...outerPts]
+        const holeStarts = []
+        for (const h of holes) {
+            holeStarts.push(verts.length / 2)
+            for (const v of h) verts.push(v)
+        }
+
+        const idx = earcut(verts, holeStarts.length ? holeStarts : null, 2)
+        for (const k of idx) allTris.push(verts[k*2], verts[k*2+1])
     }
-    return tris
+
+    return allTris.length ? new Float32Array(allTris) : null
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-// Tessellate one fill region (array of segments) → Float32Array of triangle verts.
-function tessellateRegion(segs) {
-    const contours = stitchContours(segs)
-    if (!contours.length) return null
-    return tessellateContours(contours)
-}
-
-// Tessellate all fill regions from composeFillRegions().
-// Input:  [{ color: [r,g,b,a], segs: Seg[] }]
-// Output: [{ color: [r,g,b,a], vertices: Float32Array }]
-function tessellateRegions(regions) {
-    const submeshes = []
-    for (const { color, segs } of regions) {
-        const verts = tessellateRegion(segs)
-        if (verts && verts.length >= 6) submeshes.push({ color, vertices: verts })
+// Tessellate an ordered regions array into GPU meshes, preserving paint order.
+// Input:  [{ type:'fill'|'stroke', color, segs, width? }]
+// Output: [{ color: Float32Array, vertices: Float32Array }]  (same order)
+function tessellateAll(regions) {
+    const meshes = []
+    for (const r of regions) {
+        let verts
+        if (r.type === 'fill') {
+            const contours = stitchContours(r.segs)
+            verts = contours.length ? tessellateContours(contours) : null
+        } else {
+            verts = tessellateStroke(r.segs, r.width)
+        }
+        if (verts && verts.length >= 6) meshes.push({ color: r.color, vertices: verts })
     }
-    return submeshes
+    return meshes
 }
 
-export { tessellateRegions, tessellateRegion }
+// Edge overlay: LINE_LOOP contours from fill regions only (debug wireframe).
+// Input:  [{ type, color, segs, ... }]
+// Output: [{ color: [r,g,b,a], vertices: Float32Array }]
+function extractEdgeContours(regions) {
+    const result = []
+    for (const r of regions) {
+        if (r.type !== 'fill') continue
+        const contours = stitchContours(r.segs)
+        for (const pts of contours) {
+            if (pts.length >= 4) result.push({ color: r.color, vertices: new Float32Array(pts) })
+        }
+    }
+    return result
+}
+
+// ── Stroke tessellation ───────────────────────────────────────────────────
+// Expands a flat [x,y,...] polyline into a quad strip (thick line segments).
+
+function expandPolyline(pts, halfWidth) {
+    const tris = []
+    const n = pts.length / 2
+    for (let i = 0; i < n - 1; i++) {
+        const x0 = pts[i*2],     y0 = pts[i*2+1]
+        const x1 = pts[(i+1)*2], y1 = pts[(i+1)*2+1]
+        const dx = x1 - x0, dy = y1 - y0
+        const len = Math.sqrt(dx*dx + dy*dy)
+        if (len < 1e-6) continue
+        const nx = -dy / len * halfWidth
+        const ny =  dx / len * halfWidth
+        tris.push(
+            x0+nx, y0+ny,  x0-nx, y0-ny,  x1+nx, y1+ny,
+            x1+nx, y1+ny,  x0-nx, y0-ny,  x1-nx, y1-ny,
+        )
+    }
+    return tris
+}
+
+// Tessellate stroke segments into quad-strip triangles.
+// Strokes don't need to form closed contours — stitchContours is still used
+// to chain connected segments for smooth joins, but open chains are fine.
+function tessellateStroke(segs, widthPx) {
+    const hw = widthPx / 2
+    const chains = stitchContours(segs)
+    const tris = []
+    for (const pts of chains) {
+        for (const v of expandPolyline(pts, hw)) tris.push(v)
+    }
+    return tris.length ? new Float32Array(tris) : null
+}
+
+// Input:  [{ color: [r,g,b,a], width: px, segs: Seg[] }]
+// Output: [{ color: [r,g,b,a], vertices: Float32Array }]
+function tessellateStrokes(strokeRegions) {
+    const result = []
+    for (const { color, width, segs } of strokeRegions) {
+        const verts = tessellateStroke(segs, width)
+        if (verts && verts.length >= 6) result.push({ color, vertices: verts })
+    }
+    return result
+}
+
+export { tessellateAll, extractEdgeContours }

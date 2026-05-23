@@ -176,11 +176,35 @@ function getFillColor(shapeElem, idx) {
     return [0, 0, 0, 1]
 }
 
-// ── Shape → fill region segments ───────────────────────────────────────────
+// ── Stroke style ───────────────────────────────────────────────────────────
 
-// Returns Map<fillIdx, {color, segs}> with all segments in worldMat space.
-function shapeToFillRegions(shapeElem, worldMat, fillMap) {
-    if (!fillMap) fillMap = new Map()
+function getStrokeStyle(shapeElem, idx) {
+    for (const ss of shapeElem.getElementsByTagNameNS(XFL_NS, 'StrokeStyle')) {
+        if (ss.getAttribute('index') !== String(idx)) continue
+        const sol = childByLocalName(ss, 'SolidStroke')
+        if (!sol) continue
+        const width = parseFloat(sol.getAttribute('weight') ?? '2')
+        const fillEl = childByLocalName(sol, 'fill')
+        if (fillEl) {
+            const sc = childByLocalName(fillEl, 'SolidColor')
+            if (sc) {
+                const color = sc.getAttribute('color') ?? '#000000'
+                const alpha = parseFloat(sc.getAttribute('alpha') ?? '1')
+                return { color: hexColorToRgba(color, alpha), width }
+            }
+        }
+        return { color: [0, 0, 0, 1], width }
+    }
+    return { color: [0, 0, 0, 1], width: 2 }
+}
+
+// ── Shape → fill + stroke region segments ──────────────────────────────────
+
+// Fills: Map<fillIdx, {color, segs}>  (segments in worldMat space)
+// Strokes: Map<strokeIdx, {color, width, segs}>
+function shapeToRegions(shapeElem, worldMat, fillMap, strokeMap) {
+    if (!fillMap)   fillMap   = new Map()
+    if (!strokeMap) strokeMap = new Map()
 
     for (const edgeElem of shapeElem.getElementsByTagNameNS(XFL_NS, 'Edge')) {
         const es = edgeElem.getAttribute('edges')?.trim()
@@ -192,7 +216,7 @@ function shapeToFillRegions(shapeElem, worldMat, fillMap) {
 
         const f0s = edgeElem.getAttribute('fillStyle0')
         const f1s = edgeElem.getAttribute('fillStyle1')
-        if (!f0s && !f1s) continue
+        const sss = edgeElem.getAttribute('strokeStyle')
 
         if (f0s) {
             const idx = parseInt(f0s)
@@ -204,8 +228,18 @@ function shapeToFillRegions(shapeElem, worldMat, fillMap) {
             if (!fillMap.has(idx)) fillMap.set(idx, { color: getFillColor(shapeElem, idx), segs: [] })
             for (const s of segs) fillMap.get(idx).segs.push(applyMatToSeg(worldMat, reverseSeg(s)))
         }
+        if (sss) {
+            const idx = parseInt(sss)
+            if (!strokeMap.has(idx)) strokeMap.set(idx, { ...getStrokeStyle(shapeElem, idx), segs: [] })
+            for (const s of segs) strokeMap.get(idx).segs.push(applyMatToSeg(worldMat, s))
+        }
     }
-    return fillMap
+    return { fillMap, strokeMap }
+}
+
+// Legacy fill-only wrapper (used by flat-mode traversal paths).
+function shapeToFillRegions(shapeElem, worldMat, fillMap) {
+    return shapeToRegions(shapeElem, worldMat, fillMap ?? new Map(), new Map()).fillMap
 }
 
 // ── Active frame ────────────────────────────────────────────────────────────
@@ -272,7 +306,8 @@ function collectSymbolRegions(name, symbolMap, frameNum, mat, visited, out) {
     const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
     if (!layersElem) return
 
-    for (const layer of layersElem.children) {
+    // Flash XML: layer 0 = topmost. Reverse to accumulate back-to-front.
+    for (const layer of Array.from(layersElem.children).reverse()) {
         const ltype = layer.getAttribute('layerType') ?? 'normal'
         // Skip non-rendered layer types. Mask layers skipped for now (no stencil yet).
         if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
@@ -385,7 +420,9 @@ function composeFillRegions(rootName, symbolMap, frameNum = 0) {
 // own layers — child instances are left to the hierarchy builder.
 // Layers are iterated back-to-front so the resulting array is painter-ordered.
 
-function collectGroupDirect(groupElem, parentMat, out) {
+// regions: ordered array of { type:'fill'|'stroke', color, segs, width? }
+// Fills and strokes are interleaved per-shape to preserve Flash paint order.
+function collectGroupDirect(groupElem, parentMat, regions) {
     const groupMat = readMatrix(groupElem)
     const effMat   = isIdentity(groupMat) ? parentMat : composeMat(parentMat, groupMat)
     const members  = childByLocalName(groupElem, 'members')
@@ -393,25 +430,26 @@ function collectGroupDirect(groupElem, parentMat, out) {
     for (const child of members.children) {
         const ln = child.localName
         if (ln === 'DOMShape') {
-            const sm      = readMatrix(child)
+            const sm       = readMatrix(child)
             const suppress = matsEqual(sm, groupMat)
-            const sMat    = suppress ? effMat : composeMat(effMat, sm)
-            const fillMap = new Map()
-            shapeToFillRegions(child, sMat, fillMap)
-            for (const { color, segs } of fillMap.values()) {
-                if (segs.length) out.push({ color, segs })
-            }
+            const sMat     = suppress ? effMat : composeMat(effMat, sm)
+            const { fillMap, strokeMap } = shapeToRegions(child, sMat)
+            // fills before strokes within each shape — matches Flash/SVG paint order
+            for (const { color, segs }        of fillMap.values())   if (segs.length) regions.push({ type: 'fill',   color, segs })
+            for (const { color, width, segs } of strokeMap.values()) if (segs.length) regions.push({ type: 'stroke', color, width, segs })
         } else if (ln === 'DOMGroup') {
-            collectGroupDirect(child, effMat, out)
+            collectGroupDirect(child, effMat, regions)
         }
         // DOMSymbolInstance inside a group: skip — becomes a child instance
     }
 }
 
+// Returns an ordered array of { type, color, segs, width? } — fills and strokes
+// interleaved per shape so the caller can tessellate in correct paint order.
 function collectDirectRegions(doc, frameNum) {
-    const out = []
+    const regions    = []
     const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
-    if (!layersElem) return out
+    if (!layersElem) return regions
 
     // Reverse = back-to-front (XML order is front-to-back)
     for (const layer of Array.from(layersElem.children).reverse()) {
@@ -427,18 +465,16 @@ function collectDirectRegions(doc, frameNum) {
             const ln = elem.localName
             if (ln === 'DOMShape') {
                 const shapeMat = readMatrix(elem)
-                const fillMap  = new Map()
-                shapeToFillRegions(elem, shapeMat, fillMap)
-                for (const { color, segs } of fillMap.values()) {
-                    if (segs.length) out.push({ color, segs })
-                }
+                const { fillMap, strokeMap } = shapeToRegions(elem, shapeMat)
+                for (const { color, segs }        of fillMap.values())   if (segs.length) regions.push({ type: 'fill',   color, segs })
+                for (const { color, width, segs } of strokeMap.values()) if (segs.length) regions.push({ type: 'stroke', color, width, segs })
             } else if (ln === 'DOMGroup') {
-                collectGroupDirect(elem, IDENTITY, out)
+                collectGroupDirect(elem, IDENTITY, regions)
             }
             // DOMSymbolInstance: skip — child instances are built by parseHierarchy
         }
     }
-    return out
+    return regions
 }
 
 // ── Hierarchy builder ──────────────────────────────────────────────────────
@@ -456,15 +492,16 @@ let _hierarchyIdCounter = 0
 function parseHierarchy(rootName, symbolMap, frameNum = 0) {
     const symbolGeometry = new Map()
 
-    function ensureGeometry(name) {
-        if (symbolGeometry.has(name)) return
+    function ensureGeometry(name, fn) {
+        const key = `${name}@@${fn}`
+        if (symbolGeometry.has(key)) return
         const doc = symbolMap.get(name)
-        symbolGeometry.set(name, doc ? collectDirectRegions(doc, frameNum) : [])
+        symbolGeometry.set(key, doc ? collectDirectRegions(doc, fn) : [])
     }
 
-    function buildNode(symbolName, rawMatrix, order, label, visited) {
-        ensureGeometry(symbolName)
-        if (visited.has(symbolName)) return { symbolName, rawMatrix, order, label, children: [] }
+    function buildNode(symbolName, rawMatrix, order, label, visited, fn) {
+        ensureGeometry(symbolName, fn)
+        if (visited.has(symbolName)) return { symbolName, frameNum: fn, rawMatrix, order, label, children: [] }
         visited = new Set(visited)
         visited.add(symbolName)
 
@@ -476,6 +513,28 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
 
         const allLayers = Array.from(layersElem.children)
         const children  = []
+
+        // Collect DOMSymbolInstances from elements, recursing into DOMGroups.
+        // groupAccMat: accumulated group matrix (group local → symbol local).
+        function collectInstances(elems, groupAccMat, renderOrder) {
+            for (const elem of elems) {
+                if (elem.localName === 'DOMSymbolInstance') {
+                    const childName = elem.getAttribute('libraryItemName')
+                    if (!childName) continue
+                    const iMat     = readMatrix(elem)
+                    // Compose: group chain first, then instance placement.
+                    const finalMat = isIdentity(groupAccMat) ? iMat : composeMat(groupAccMat, iMat)
+                    const ff       = parseInt(elem.getAttribute('firstFrame') ?? '0')
+                    const lbl      = childName.split('/').pop().replace(/^~/, '')
+                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, ff))
+                } else if (elem.localName === 'DOMGroup') {
+                    const gMat    = readMatrix(elem)
+                    const newAcc  = isIdentity(gMat) ? groupAccMat : composeMat(groupAccMat, gMat)
+                    const members = childByLocalName(elem, 'members')
+                    if (members) collectInstances(Array.from(members.children), newAcc, renderOrder)
+                }
+            }
+        }
 
         for (let i = 0; i < allLayers.length; i++) {
             const layer = allLayers[i]
@@ -489,23 +548,15 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
 
             // FLA layer 0 = topmost; renderOrder ascending = back-to-front
             const renderOrder = allLayers.length - i
-
-            for (const elem of elements.children) {
-                if (elem.localName !== 'DOMSymbolInstance') continue
-                const childName = elem.getAttribute('libraryItemName')
-                if (!childName) continue
-                const childMat  = readMatrix(elem)
-                const childLabel = childName.split('/').pop().replace(/^~/, '')
-                children.push(buildNode(childName, childMat, renderOrder, childLabel, visited))
-            }
+            collectInstances(Array.from(elements.children), IDENTITY, renderOrder)
         }
 
         children.sort((a, b) => a.order - b.order)
-        return { symbolName, rawMatrix, order, label, children }
+        return { symbolName, frameNum: fn, rawMatrix, order, label, children }
     }
 
     const rootLabel = rootName.split('/').pop().replace(/^~/, '')
-    const rootNode  = buildNode(rootName, IDENTITY, 0, rootLabel, new Set())
+    const rootNode  = buildNode(rootName, IDENTITY, 0, rootLabel, new Set(), frameNum)
     return { symbolGeometry, rootNode }
 }
 

@@ -370,6 +370,16 @@ canvas.addEventListener('wheel', e => {
 let _prog        = null
 let _uniforms    = null
 const _symbolVaos = new Map()   // symbol.id → { vao, vertexCount }
+const _edgeVaos   = new Map()   // symbol.id → [{ vao, count, color }]
+
+let _showEdges = false   // E key toggles
+
+window.addEventListener('keydown', e => {
+    if (e.code === 'KeyE' && !e.repeat) {
+        _showEdges = !_showEdges
+        viewport.markDirty()
+    }
+})
 
 let _passeProg  = null
 let _passeColor = null
@@ -410,16 +420,23 @@ const viewport = {
             return { vao, vertexCount: vertices.length / 2 }
         }
 
-        if (sym.submeshes) {
-            // Multi-fill symbol: one VAO per submesh, each with its own color
-            const submeshVaos = sym.submeshes.map(sm => ({
-                color: new Float32Array(sm.color),
-                ...makeVao(sm.vertices),
-            }))
-            _symbolVaos.set(sym.id, { submeshes: submeshVaos })
+        if (sym.meshes?.length) {
+            // Ordered fill+stroke meshes — one VAO per entry, drawn in array order
+            _symbolVaos.set(sym.id, sym.meshes.map(m => ({
+                color: new Float32Array(m.color),
+                ...makeVao(m.vertices),
+            })))
         } else if (sym.vertices) {
             // Legacy single-mesh symbol
-            _symbolVaos.set(sym.id, makeVao(sym.vertices))
+            _symbolVaos.set(sym.id, [{ color: new Float32Array(sym.color ?? [0,0,0,1]), ...makeVao(sym.vertices) }])
+        }
+
+        // Edge overlay: one VAO per stitched contour (LINE_LOOP)
+        if (sym.edgeContours?.length) {
+            _edgeVaos.set(sym.id, sym.edgeContours.map(({ color, vertices }) => ({
+                color: new Float32Array(color),
+                ...makeVao(vertices),
+            })))
         }
     },
 
@@ -466,6 +483,8 @@ const viewport = {
 
         gl.useProgram(_prog)
         gl.uniformMatrix3fv(_uniforms.viewMatrix, false, worldToClipMatrix())
+        gl.enable(gl.BLEND)
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
         // Build children map sorted by order (ascending = back-to-front).
         const childrenOf = new Map()
@@ -487,19 +506,12 @@ const viewport = {
                 const worldMat = composeMat3(parentWorldMat, localMat)
                 const mesh     = _symbolVaos.get(inst.symbolId)
 
-                if (mesh) {
+                if (mesh?.length) {
                     gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
-                    if (mesh.submeshes) {
-                        for (const sm of mesh.submeshes) {
-                            gl.uniform4fv(_uniforms.color, sm.color)
-                            gl.bindVertexArray(sm.vao)
-                            gl.drawArrays(gl.TRIANGLES, 0, sm.vertexCount)
-                        }
-                    } else {
-                        const sym = scene.symbols.find(s => s.id === inst.symbolId)
-                        if (sym) gl.uniform4fv(_uniforms.color, sym.color)
-                        gl.bindVertexArray(mesh.vao)
-                        gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount)
+                    for (const { vao, vertexCount, color } of mesh) {
+                        gl.uniform4fv(_uniforms.color, color)
+                        gl.bindVertexArray(vao)
+                        gl.drawArrays(gl.TRIANGLES, 0, vertexCount)
                     }
                 }
 
@@ -508,6 +520,43 @@ const viewport = {
         }
 
         drawSubtree(null, _IDENTITY_GL)
+
+        // ── Edge overlay pass ────────────────────────────────────────────
+        if (_showEdges) {
+            const SEL_COLOR = new Float32Array([1.0, 0.85, 0.1, 1.0])   // yellow highlight
+            const _dimColor = new Float32Array(4)                        // reused scratch
+
+            const drawEdgeSubtree = (parentId, parentWorldMat) => {
+                for (const inst of (childrenOf.get(parentId) ?? [])) {
+                    const localMat  = instanceLocalMat(inst, frame, isDragging, dragInstanceId)
+                    const worldMat  = composeMat3(parentWorldMat, localMat)
+                    const contours  = _edgeVaos.get(inst.symbolId)
+                    const isSelected = inst.id === selectedId
+
+                    if (contours?.length) {
+                        gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+                        for (const { vao, vertexCount, color } of contours) {
+                            let drawColor
+                            if (isSelected) {
+                                drawColor = SEL_COLOR
+                            } else {
+                                _dimColor[0] = color[0]; _dimColor[1] = color[1]
+                                _dimColor[2] = color[2]; _dimColor[3] = color[3] * 0.3
+                                drawColor = _dimColor
+                            }
+                            gl.uniform4fv(_uniforms.color, drawColor)
+                            gl.bindVertexArray(vao)
+                            gl.drawArrays(gl.LINE_LOOP, 0, vertexCount)
+                        }
+                    }
+
+                    drawEdgeSubtree(inst.id, worldMat)
+                }
+            }
+
+            drawEdgeSubtree(null, _IDENTITY_GL)
+        }
+
         gl.bindVertexArray(null)
     },
 
@@ -537,10 +586,7 @@ const viewport = {
         gl.bindVertexArray(_passeVao)
         gl.bindBuffer(gl.ARRAY_BUFFER, _passeVbo)
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, v)
-        gl.enable(gl.BLEND)
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
         gl.drawArrays(gl.TRIANGLES, 0, 24)
-        gl.disable(gl.BLEND)
         gl.bindVertexArray(null)
     },
 
