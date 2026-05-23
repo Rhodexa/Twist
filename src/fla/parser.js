@@ -244,16 +244,21 @@ function shapeToFillRegions(shapeElem, worldMat, fillMap) {
 
 // ── Active frame ────────────────────────────────────────────────────────────
 
+// Returns the DOMFrame active at frameNum, implementing Flash's "hold last keyframe"
+// rule: a keyframe's content persists past its explicit duration until the next
+// keyframe starts. This matches Flash's default layer behaviour for static geometry.
 function activeFrame(layerElem, frameNum) {
     const framesElem = childByLocalName(layerElem, 'frames')
     if (!framesElem) return null
+    let best = null
     for (const f of framesElem.children) {
         if (f.localName !== 'DOMFrame') continue
         const idx = parseInt(f.getAttribute('index') ?? '0')
         const dur = parseInt(f.getAttribute('duration') ?? '1')
-        if (idx <= frameNum && frameNum < idx + dur) return f
+        if (idx <= frameNum && frameNum < idx + dur) return f   // exact match
+        if (idx <= frameNum) best = f                           // last keyframe before frameNum
     }
-    return null
+    return best
 }
 
 // ── Group traversal ────────────────────────────────────────────────────────

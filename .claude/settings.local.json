@@ -6,7 +6,8 @@
       "Bash(python3 -c ' *)",
       "Bash(python3)",
       "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/*'\\)[:5]\\)\")",
-      "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/**/*.fla', recursive=True\\)[:5]\\)\")"
+      "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/**/*.fla', recursive=True\\)[:5]\\)\")",
+      "Bash(dir \"c:\\\\Users\\\\Celestia\\\\Desktop\\\\Rhode\\\\FLA-RE\")"
     ]
   }
 }

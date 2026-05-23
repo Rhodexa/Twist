@@ -412,8 +412,20 @@ const viewport = {
 
     markDirty() { this.dirty = true },
 
+    // Free all symbol VAOs and clear the caches. Call before a full scene reload.
+    clearSymbolVaos() {
+        for (const meshes of _symbolVaos.values())
+            for (const { vao } of meshes) gl.deleteVertexArray(vao)
+        for (const contours of _edgeVaos.values())
+            for (const { vao } of contours) gl.deleteVertexArray(vao)
+        _symbolVaos.clear()
+        _edgeVaos.clear()
+    },
+
     // Build GL VAO(s) for a symbol by id. Safe to call after init() for new symbols.
+    // No-op if the symbol's VAOs are already uploaded — safe to call on every frame apply.
     buildSymbolVaos(symId) {
+        if (_symbolVaos.has(symId)) return
         const sym = scene.symbols.find(s => s.id === symId)
         if (!sym) return
 
