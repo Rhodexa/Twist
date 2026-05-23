@@ -36,4 +36,22 @@ void main() {
 }
 `
 
-export { VERT_SCENE, FRAG_SCENE, VERT_PASSE }
+// Checkerboard background — screen-space, fixed tile, dark-mode palette.
+// Two uniforms: uScale (tile size px), uOpacity (blended over cleared bg).
+const FRAG_CHECKER = /* glsl */`#version 300 es
+precision highp float;
+
+uniform float uScale;
+uniform float uOpacity;
+
+out vec4 fragColor;
+
+void main() {
+    vec2  cell    = floor(gl_FragCoord.xy / uScale);
+    float checker = mod(cell.x + cell.y, 2.0);
+    vec3  col     = mix(vec3(0.094), vec3(0.157), checker);
+    fragColor = vec4(col, uOpacity);
+}
+`
+
+export { VERT_SCENE, FRAG_SCENE, VERT_PASSE, FRAG_CHECKER }

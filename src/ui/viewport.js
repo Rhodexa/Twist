@@ -4,7 +4,7 @@
 import scene                      from '../scene/scene.js'
 import journal                    from '../journal/journal.js'
 import { createProgram }          from '../gl/program.js'
-import { VERT_SCENE, FRAG_SCENE, VERT_PASSE } from '../gl/shaders.js'
+import { VERT_SCENE, FRAG_SCENE, VERT_PASSE, FRAG_CHECKER } from '../gl/shaders.js'
 import { evaluateInstance }       from '../scene/evaluate.js'
 
 // ── Canvas setup ──────────────────────────────────────────────────────────
@@ -386,6 +386,15 @@ let _passeColor = null
 let _passeVao   = null
 let _passeVbo   = null
 
+// ── Checkerboard background ───────────────────────────────────────────────
+
+const checker = { enabled: true, scale: 20, opacity: 0.55 }
+
+let _checkerProg    = null
+let _checkerScale   = null
+let _checkerOpacity = null
+let _checkerVao     = null
+
 // ── Viewport object ───────────────────────────────────────────────────────
 
 const viewport = {
@@ -474,11 +483,6 @@ const viewport = {
     },
 
     _renderScene() {
-        gl.viewport(0, 0, canvas.width, canvas.height)
-        const [r, g, b] = cssVarToGL('--bg-base')
-        gl.clearColor(r, g, b, 1.0)
-        gl.clear(gl.COLOR_BUFFER_BIT)
-
         if (!_prog) return
 
         gl.useProgram(_prog)
@@ -636,9 +640,30 @@ const viewport = {
         ctx2d.restore()
     },
 
+    _renderClear() {
+        gl.viewport(0, 0, canvas.width, canvas.height)
+        const [r, g, b] = cssVarToGL('--bg-base')
+        gl.clearColor(r, g, b, 1.0)
+        gl.clear(gl.COLOR_BUFFER_BIT)
+    },
+
+    _renderCheckerboard() {
+        if (!checker.enabled || !_checkerProg) return
+        gl.useProgram(_checkerProg)
+        gl.uniform1f(_checkerScale,   checker.scale)
+        gl.uniform1f(_checkerOpacity, checker.opacity)
+        gl.enable(gl.BLEND)
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+        gl.bindVertexArray(_checkerVao)
+        gl.drawArrays(gl.TRIANGLES, 0, 6)
+        gl.bindVertexArray(null)
+    },
+
     _render() {
         if (!this.dirty) return
         this.dirty = false
+        this._renderClear()
+        this._renderCheckerboard()
         this._renderScene()
         this._renderPassepartout()
         this._renderOverlay()
@@ -664,6 +689,57 @@ const viewport = {
         gl.enableVertexAttribArray(0)
         gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
         gl.bindVertexArray(null)
+
+        // Checkerboard — fullscreen quad, static VBO
+        _checkerProg    = createProgram(gl, VERT_PASSE, FRAG_CHECKER)
+        _checkerScale   = gl.getUniformLocation(_checkerProg, 'uScale')
+        _checkerOpacity = gl.getUniformLocation(_checkerProg, 'uOpacity')
+        _checkerVao     = gl.createVertexArray()
+        const _checkerVbo = gl.createBuffer()
+        gl.bindVertexArray(_checkerVao)
+        gl.bindBuffer(gl.ARRAY_BUFFER, _checkerVbo)
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1,-1,  1,-1,  -1,1,
+             1,-1,  1, 1,  -1,1,
+        ]), gl.STATIC_DRAW)
+        gl.enableVertexAttribArray(0)
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+        gl.bindVertexArray(null)
+
+        // Checker controls widget
+        const checkerWidget = document.createElement('div')
+        checkerWidget.id = 'checker-widget'
+        checkerWidget.style.cssText = [
+            'position:absolute', 'bottom:12px', 'left:12px',
+            'display:flex', 'align-items:center', 'gap:8px',
+            'background:rgba(0,0,0,0.55)', 'border:1px solid rgba(255,255,255,0.08)',
+            'border-radius:6px', 'padding:5px 10px',
+            'font:11px/1 monospace', 'color:rgba(255,255,255,0.6)',
+            'user-select:none', 'pointer-events:all',
+        ].join(';')
+        checkerWidget.innerHTML = `
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+                <input type="checkbox" id="ck-enable" ${checker.enabled ? 'checked' : ''}> BG
+            </label>
+            <label style="display:flex;align-items:center;gap:4px">
+                scale
+                <input type="range" id="ck-scale" min="8" max="64" step="4" value="${checker.scale}" style="width:60px">
+            </label>
+            <label style="display:flex;align-items:center;gap:4px">
+                opacity
+                <input type="range" id="ck-opacity" min="0" max="1" step="0.05" value="${checker.opacity}" style="width:60px">
+            </label>`
+        container.appendChild(checkerWidget)
+
+        document.getElementById('ck-enable').addEventListener('change', e => {
+            checker.enabled = e.target.checked; this.markDirty()
+        })
+        document.getElementById('ck-scale').addEventListener('input', e => {
+            checker.scale = parseFloat(e.target.value); this.markDirty()
+        })
+        document.getElementById('ck-opacity').addEventListener('input', e => {
+            checker.opacity = parseFloat(e.target.value); this.markDirty()
+        })
 
         // Build VAOs for all symbols in the initial scene
         for (const sym of scene.symbols) this.buildSymbolVaos(sym.id)

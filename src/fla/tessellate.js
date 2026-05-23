@@ -237,17 +237,41 @@ function extractEdgeContours(regions) {
 
 // ── Stroke tessellation ───────────────────────────────────────────────────
 // Expands a flat [x,y,...] polyline into triangle vertices using per-vertex
-// miter normals for smooth, gap-free joins.
+// miter normals for smooth, gap-free joins, plus round caps on open ends.
 //
 // At each interior vertex the offset direction is the bisector of the two
 // adjacent edge normals, scaled by 1/cos(θ/2) so the stroke width is
 // preserved perpendicular to each edge.  The scale is clamped to MITER_LIMIT
-// to prevent runaway spikes at near-180° kinks; beyond that limit the inner
-// edge self-intersection risk is zero and the outer simply gets a flat cap.
+// to prevent runaway spikes at near-180° kinks.
 //
-// closed=true wraps end→start so a closed stroke outline has no seam.
+// Round caps: at each open endpoint a semicircular fan sweeps the left-normal
+// 180° through the backward (start) or forward (end) tangent to the right-
+// normal.  CAP_STEPS controls smoothness; 8 is visually indistinguishable
+// from a true circle at typical cartoon stroke widths.
+//
+// closed=true wraps end→start so a closed stroke outline has no cap or seam.
 
 const MITER_LIMIT = 4.0
+const CAP_STEPS   = 8
+
+// Append a semicircular cap fan into tris.
+// (cx,cy)      — endpoint centre
+// (nx,ny)      — left-facing edge normal at this endpoint (unit)
+// (capDx,capDy)— direction the cap bulges outward (unit, ⊥ to normal)
+// Sweeps from +normal → capDir → -normal in CAP_STEPS triangles.
+function addRoundCap(tris, cx, cy, nx, ny, capDx, capDy, halfWidth) {
+    for (let k = 0; k < CAP_STEPS; k++) {
+        const a0 = Math.PI *  k      / CAP_STEPS
+        const a1 = Math.PI * (k + 1) / CAP_STEPS
+        tris.push(
+            cx, cy,
+            cx + (nx * Math.cos(a0) + capDx * Math.sin(a0)) * halfWidth,
+            cy + (ny * Math.cos(a0) + capDy * Math.sin(a0)) * halfWidth,
+            cx + (nx * Math.cos(a1) + capDx * Math.sin(a1)) * halfWidth,
+            cy + (ny * Math.cos(a1) + capDy * Math.sin(a1)) * halfWidth,
+        )
+    }
+}
 
 function expandPolyline(pts, halfWidth, closed = false) {
     const n = pts.length / 2
@@ -309,8 +333,28 @@ function expandPolyline(pts, halfWidth, closed = false) {
         vrx[i] = px - mx * scale;  vry[i] = py - my * scale
     }
 
-    // Build two triangles per edge.
     const tris = []
+
+    // Round caps on open polylines.
+    // Tangent from normal: tangent = (eny, -enx), so backward = (-eny, enx).
+    if (!closed) {
+        // Start cap — cap bulges backward (opposite the first edge tangent).
+        addRoundCap(tris,
+            pts[0], pts[1],
+            enx[0], eny[0],
+            -eny[0], enx[0],   // backward tangent
+            halfWidth)
+
+        // End cap — cap bulges forward (along the last edge tangent).
+        const e = edgeCount - 1
+        addRoundCap(tris,
+            pts[(n-1)*2], pts[(n-1)*2+1],
+            enx[e], eny[e],
+            eny[e], -enx[e],   // forward tangent
+            halfWidth)
+    }
+
+    // Build two triangles per edge.
     for (let i = 0; i < edgeCount; i++) {
         const j = (i + 1) % n
         tris.push(
