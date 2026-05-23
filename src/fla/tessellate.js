@@ -236,36 +236,109 @@ function extractEdgeContours(regions) {
 }
 
 // ── Stroke tessellation ───────────────────────────────────────────────────
-// Expands a flat [x,y,...] polyline into a quad strip (thick line segments).
+// Expands a flat [x,y,...] polyline into triangle vertices using per-vertex
+// miter normals for smooth, gap-free joins.
+//
+// At each interior vertex the offset direction is the bisector of the two
+// adjacent edge normals, scaled by 1/cos(θ/2) so the stroke width is
+// preserved perpendicular to each edge.  The scale is clamped to MITER_LIMIT
+// to prevent runaway spikes at near-180° kinks; beyond that limit the inner
+// edge self-intersection risk is zero and the outer simply gets a flat cap.
+//
+// closed=true wraps end→start so a closed stroke outline has no seam.
 
-function expandPolyline(pts, halfWidth) {
-    const tris = []
+const MITER_LIMIT = 4.0
+
+function expandPolyline(pts, halfWidth, closed = false) {
     const n = pts.length / 2
-    for (let i = 0; i < n - 1; i++) {
-        const x0 = pts[i*2],     y0 = pts[i*2+1]
-        const x1 = pts[(i+1)*2], y1 = pts[(i+1)*2+1]
-        const dx = x1 - x0, dy = y1 - y0
+    if (n < 2) return []
+
+    const edgeCount = closed ? n : n - 1
+
+    // Per-edge left-facing unit normals.
+    const enx = new Float32Array(edgeCount)
+    const eny = new Float32Array(edgeCount)
+    for (let i = 0; i < edgeCount; i++) {
+        const j  = (i + 1) % n
+        const dx = pts[j*2]   - pts[i*2]
+        const dy = pts[j*2+1] - pts[i*2+1]
         const len = Math.sqrt(dx*dx + dy*dy)
-        if (len < 1e-6) continue
-        const nx = -dy / len * halfWidth
-        const ny =  dx / len * halfWidth
+        if (len > 1e-6) { enx[i] = -dy / len; eny[i] = dx / len }
+    }
+
+    // Per-vertex miter offset (left and right world-space points).
+    const vlx = new Float32Array(n), vly = new Float32Array(n)
+    const vrx = new Float32Array(n), vry = new Float32Array(n)
+
+    for (let i = 0; i < n; i++) {
+        const px = pts[i*2], py = pts[i*2+1]
+
+        // Which edges are adjacent?
+        let n1x, n1y, n2x, n2y
+        if (closed) {
+            const pe = (i - 1 + edgeCount) % edgeCount
+            n1x = enx[pe]; n1y = eny[pe]
+            n2x = enx[i % edgeCount]; n2y = eny[i % edgeCount]
+        } else if (i === 0) {
+            n1x = enx[0]; n1y = eny[0]; n2x = enx[0]; n2y = eny[0]
+        } else if (i === n - 1) {
+            n1x = enx[edgeCount-1]; n1y = eny[edgeCount-1]
+            n2x = enx[edgeCount-1]; n2y = eny[edgeCount-1]
+        } else {
+            n1x = enx[i-1]; n1y = eny[i-1]
+            n2x = enx[i];   n2y = eny[i]
+        }
+
+        // Bisector of the two normals.
+        let mx = n1x + n2x, my = n1y + n2y
+        const mlen = Math.sqrt(mx*mx + my*my)
+
+        let scale
+        if (mlen < 1e-6) {
+            // ~180° reversal — use outgoing normal, no amplification needed.
+            mx = n2x; my = n2y; scale = halfWidth
+        } else {
+            mx /= mlen; my /= mlen
+            const cosHalf = mx * n2x + my * n2y
+            scale = cosHalf > 1e-4
+                ? Math.min(halfWidth / cosHalf, halfWidth * MITER_LIMIT)
+                : halfWidth * MITER_LIMIT
+        }
+
+        vlx[i] = px + mx * scale;  vly[i] = py + my * scale
+        vrx[i] = px - mx * scale;  vry[i] = py - my * scale
+    }
+
+    // Build two triangles per edge.
+    const tris = []
+    for (let i = 0; i < edgeCount; i++) {
+        const j = (i + 1) % n
         tris.push(
-            x0+nx, y0+ny,  x0-nx, y0-ny,  x1+nx, y1+ny,
-            x1+nx, y1+ny,  x0-nx, y0-ny,  x1-nx, y1-ny,
+            vlx[i], vly[i],  vrx[i], vry[i],  vlx[j], vly[j],
+            vlx[j], vly[j],  vrx[i], vry[i],  vrx[j], vry[j],
         )
     }
     return tris
 }
 
-// Tessellate stroke segments into quad-strip triangles.
-// Strokes don't need to form closed contours — stitchContours is still used
-// to chain connected segments for smooth joins, but open chains are fine.
+// Returns true when the first and last points of a polyline are the same
+// vertex (within tolerance), meaning the contour closes on itself.
+function isClosedPolyline(pts) {
+    const n = pts.length / 2
+    if (n < 3) return false
+    const dx = pts[0] - pts[(n-1)*2]
+    const dy = pts[1] - pts[(n-1)*2+1]
+    return dx*dx + dy*dy <= STITCH_EPS * STITCH_EPS * 4
+}
+
+// Tessellate stroke segments into triangle meshes with proper miter joins.
 function tessellateStroke(segs, widthPx) {
     const hw = widthPx / 2
     const chains = stitchContours(segs)
     const tris = []
     for (const pts of chains) {
-        for (const v of expandPolyline(pts, hw)) tris.push(v)
+        const closed = isClosedPolyline(pts)
+        for (const v of expandPolyline(pts, hw, closed)) tris.push(v)
     }
     return tris.length ? new Float32Array(tris) : null
 }
