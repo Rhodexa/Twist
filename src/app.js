@@ -6,6 +6,7 @@ import viewport                   from './ui/viewport.js'
 import { initTimelineUI, togglePlay } from './ui/timeline-ui.js'
 import { importFla, scrubToFrame } from './fla/import.js'
 import { initOutliner }          from './ui/outliner.js'
+import { initCompositor }        from './ui/compositor.js'
 import                                 './input/input.js'   // registers Ctrl+Z / Y / S
 import { init as initTransformTool }  from './tools/transform-tool.js'
 
@@ -14,6 +15,7 @@ import { init as initTransformTool }  from './tools/transform-tool.js'
 viewport.init()
 initTimelineUI()
 initOutliner()
+initCompositor()
 initTransformTool()    // G / R / S modal transform tool
 
 // ── App-level keyboard shortcuts ──────────────────────────────────────────

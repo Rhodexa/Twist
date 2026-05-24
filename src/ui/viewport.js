@@ -375,6 +375,11 @@ let _uniforms    = null
 const _symbolVaos = new Map()
 const _edgeVaos   = new Map()
 
+// Compositor hover highlight — null | { instId, maskLayerIdx? }
+let _hoverHighlight = null
+const _HIGHLIGHT_INST = new Float32Array([0.0, 0.85, 1.0, 0.30])   // cyan
+const _HIGHLIGHT_MASK = new Float32Array([1.0, 0.20, 0.85, 0.55])   // magenta
+
 let _showEdges = false
 
 window.addEventListener('keydown', e => {
@@ -427,6 +432,11 @@ const viewport = {
         const p0 = applyMat3(inv, 0,   0  )
         const pd = applyMat3(inv, wdx, wdy)
         return { x: pd.x - p0.x, y: pd.y - p0.y }
+    },
+
+    setHoverHighlight(instId, maskLayerIdx = null) {
+        _hoverHighlight = instId ? { instId, maskLayerIdx } : null
+        this.markDirty()
     },
 
     dirty:          true,
@@ -485,12 +495,14 @@ const viewport = {
         if (sym.renderGroups?.length) {
             _symbolVaos.set(sym.id, sym.renderGroups.map(g => {
                 if (g.type === 'plain') {
-                    return { type: 'plain', vaos: g.meshes.map(meshToEntry) }
+                    return { type: 'plain', order: g.order ?? 0, vaos: g.meshes.map(meshToEntry) }
                 }
                 return {
-                    type:        'masked',
-                    maskVaos:    g.maskMeshes.map(m => makeVao(m.vertices)),
-                    contentVaos: g.contentMeshes.map(meshToEntry),
+                    type:         'masked',
+                    order:        g.order ?? 0,
+                    maskLayerIdx: g.maskLayerIdx,
+                    maskVaos:     g.maskMeshes.map(m => makeVao(m.vertices)),
+                    contentVaos:  g.contentMeshes.map(meshToEntry),
                 }
             }))
         } else if (sym.meshes?.length) {
@@ -587,17 +599,15 @@ const viewport = {
             gl.drawArrays(gl.TRIANGLES, 0, entry.vertexCount)
         }
 
-        // Draw a masked group using the WebGL stencil buffer.
-        // Mask geometry is written to stencil (no colour output), then content
-        // is rendered only where stencil == 1. Stencil is cleared after each group
-        // so masks from different instances don't interfere.
-        const drawMaskedGroup = (group, worldMat) => {
-            gl.enable(gl.STENCIL_TEST)
+        // Stencil depth — supports nested masks via INCR/DECR (one counter per frame).
+        let stencilDepth = 0
 
-            // Pass 1: write mask shape into stencil, suppress colour output.
-            gl.stencilFunc(gl.ALWAYS, 1, 0xFF)
-            gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE)
+        // Push a mask: INCR stencil where mask shape is, inside the current parent mask.
+        const pushMask = (group, worldMat) => {
+            if (stencilDepth === 0) gl.enable(gl.STENCIL_TEST)
             gl.colorMask(false, false, false, false)
+            gl.stencilFunc(gl.EQUAL, stencilDepth, 0xFF)
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.INCR)
             gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
             gl.uniform1i(_uniforms.fillType, 0)
             gl.uniform4fv(_uniforms.color, _WHITE)
@@ -606,39 +616,132 @@ const viewport = {
                 gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
             }
             gl.colorMask(true, true, true, true)
-
-            // Pass 2: draw content clipped to stencil.
-            gl.stencilFunc(gl.EQUAL, 1, 0xFF)
+            stencilDepth++
+            gl.stencilFunc(gl.EQUAL, stencilDepth, 0xFF)
             gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP)
-            for (const cv of group.contentVaos) drawEntry(cv, worldMat)
-
-            // Restore stencil state for subsequent draws.
-            gl.stencilMask(0xFF)
-            gl.clear(gl.STENCIL_BUFFER_BIT)
-            gl.disable(gl.STENCIL_TEST)
         }
 
-        const drawSubtree = (parentId, parentWorldMat) => {
-            for (const inst of (childrenOf.get(parentId) ?? [])) {
-                const localMat = instanceLocalMat(inst, frame, isDragging, dragInstanceId)
-                const worldMat = composeMat3(parentWorldMat, localMat)
-                const groups   = _symbolVaos.get(inst.symbolId)
-
-                if (groups?.length) {
-                    for (const group of groups) {
-                        if (group.type === 'plain') {
-                            for (const entry of group.vaos) drawEntry(entry, worldMat)
-                        } else {
-                            drawMaskedGroup(group, worldMat)
-                        }
-                    }
-                }
-
-                drawSubtree(inst.id, worldMat)
+        // Pop a mask: DECR stencil back where the mask shape was, restoring parent mask.
+        const popMask = (group, worldMat) => {
+            gl.colorMask(false, false, false, false)
+            gl.stencilFunc(gl.EQUAL, stencilDepth, 0xFF)
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.DECR)
+            gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+            gl.uniform1i(_uniforms.fillType, 0)
+            gl.uniform4fv(_uniforms.color, _WHITE)
+            for (const mv of group.maskVaos) {
+                gl.bindVertexArray(mv.vao)
+                gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
+            }
+            gl.colorMask(true, true, true, true)
+            stencilDepth--
+            if (stencilDepth === 0) {
+                gl.disable(gl.STENCIL_TEST)
+            } else {
+                gl.stencilFunc(gl.EQUAL, stencilDepth, 0xFF)
+                gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP)
             }
         }
 
-        drawSubtree(null, _IDENTITY_GL)
+        // Draw an instance and its full subtree.
+        // Hierarchy children tagged maskedByLayerIdx are drawn inside their parent's stencil;
+        // all others are drawn normally after the symbol's own render groups.
+        const drawInstTree = (inst, worldMat) => {
+            const groups = _symbolVaos.get(inst.symbolId)
+
+            // Partition this instance's children by which mask group (if any) clips them.
+            const maskedByGroup = new Map()   // maskLayerIdx → [child, ...]
+            const unmaskedKids  = []
+            const knownMaskIdxs = new Set(
+                groups?.filter(g => g.type === 'masked').map(g => g.maskLayerIdx) ?? []
+            )
+            for (const child of (childrenOf.get(inst.id) ?? [])) {
+                const ml = child.maskedByLayerIdx
+                if (ml != null && knownMaskIdxs.has(ml)) {
+                    if (!maskedByGroup.has(ml)) maskedByGroup.set(ml, [])
+                    maskedByGroup.get(ml).push(child)
+                } else {
+                    unmaskedKids.push(child)
+                }
+            }
+
+            // Merge render groups and unmasked children into one draw sequence,
+            // sorted by order so layer-stack position is respected.
+            // Masked children are still drawn inside their mask group, not here.
+            const drawSeq = []
+            for (const group of (groups ?? []))
+                drawSeq.push({ isGroup: true,  group, order: group.order ?? 0 })
+            for (const child of unmaskedKids)
+                drawSeq.push({ isGroup: false, child, order: child.order ?? 0 })
+            drawSeq.sort((a, b) => a.order - b.order)
+
+            for (const item of drawSeq) {
+                if (item.isGroup) {
+                    const group = item.group
+                    if (group.type === 'plain') {
+                        for (const entry of group.vaos) drawEntry(entry, worldMat)
+                    } else {
+                        const maskedKids = maskedByGroup.get(group.maskLayerIdx) ?? []
+                        pushMask(group, worldMat)
+                        for (const cv of group.contentVaos) drawEntry(cv, worldMat)
+                        for (const kid of maskedKids) {
+                            const kidMat = composeMat3(worldMat, instanceLocalMat(kid, frame, isDragging, dragInstanceId))
+                            drawInstTree(kid, kidMat)
+                        }
+                        popMask(group, worldMat)
+                    }
+                } else {
+                    const childMat = composeMat3(worldMat, instanceLocalMat(item.child, frame, isDragging, dragInstanceId))
+                    drawInstTree(item.child, childMat)
+                }
+            }
+        }
+
+        for (const inst of (childrenOf.get(null) ?? [])) {
+            drawInstTree(inst, instanceLocalMat(inst, frame, isDragging, dragInstanceId))
+        }
+
+        // ── Compositor hover highlight pass ──────────────────────────────
+        if (_hoverHighlight) {
+            const inst = scene.instances.find(i => i.id === _hoverHighlight.instId)
+            if (inst) {
+                gl.disable(gl.STENCIL_TEST)
+                gl.enable(gl.BLEND)
+                gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+                gl.uniform1i(_uniforms.fillType, 0)
+
+                const worldMat = getInstanceWorldMat(inst, frame)
+                gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+
+                const groups = _symbolVaos.get(inst.symbolId)
+
+                if (_hoverHighlight.maskLayerIdx != null) {
+                    // Highlight just the mask shape for this mask group
+                    const group = groups?.find(g => g.type === 'masked' && g.maskLayerIdx === _hoverHighlight.maskLayerIdx)
+                    if (group) {
+                        gl.uniform4fv(_uniforms.color, _HIGHLIGHT_MASK)
+                        for (const mv of group.maskVaos) {
+                            gl.bindVertexArray(mv.vao)
+                            gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
+                        }
+                    }
+                } else {
+                    // Highlight all geometry for this instance's symbol
+                    gl.uniform4fv(_uniforms.color, _HIGHLIGHT_INST)
+                    if (groups) {
+                        for (const group of groups) {
+                            const vaos = group.type === 'plain'
+                                ? group.vaos
+                                : [...group.maskVaos, ...group.contentVaos]
+                            for (const v of vaos) {
+                                gl.bindVertexArray(v.vao)
+                                gl.drawArrays(gl.TRIANGLES, 0, v.vertexCount)
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Edge overlay pass ────────────────────────────────────────────
         if (_showEdges) {

@@ -16,6 +16,16 @@ To understand the FLA format before writing a line of Twist's importer, we built
 
 Getting Twilight Sparkle and Rainbow Dash rendering correctly in a custom WebGL2 renderer turned out to be a pretty good way to shake out an importer.
 
+IMPORTANT:
+Check ../FLA-RE/ for reference.
+The python tools in there, render frames to almost* perfection for all .fla we have tried. Making it a source of absolute truth regarding how to parse FLA files. If you are ever in doubt about how to implement any specific functionality about .fla, check there.
+
+(To the best of our knowledge, this tool actually _does_ perfection, but we haven't tried edge cases outside of the .fla files found in ../FLA-RE/fla/ those files however, render to perfection by our measures.)
+
 ---
 
 *Twist is a personal project. It is not trying to be Blender. It is not trying to be famous. It is a fast, honest tool for making cartoons without fighting software.*
+
+--- 
+Director:
+I will be here to help you, and you can ask me any question or to help you debug stuff at any time.

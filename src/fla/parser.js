@@ -310,11 +310,12 @@ function collectGroupDirect(groupElem, parentMat, regions) {
 // Groups are in back-to-front (painter's) order.
 // Mask layer relationship is determined via parentLayerIndex (same as FLA-RE).
 
-function collectDirectRegions(doc, frameNum) {
+function collectDirectRegions(doc, frameNum, symbolMap) {
     const regions    = []
     const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
     if (!layersElem) return []
 
+    const symName  = doc.documentElement?.getAttribute('name') ?? '?'
     const allLayers = Array.from(layersElem.children)
 
     // Build mask group mappings — mirrors FLA-RE's mask_groups / consumed sets.
@@ -332,8 +333,54 @@ function collectDirectRegions(doc, frameNum) {
         }
     }
 
+    // Recursively flatten a symbol's geometry into parentMat's coordinate space.
+    // Used for DOMSymbolInstances that appear directly on mask/content layers —
+    // these must contribute geometry inline rather than as hierarchy children.
+    function collectSymFlat(instName, parentMat, firstFrame, out, visited = new Set()) {
+        if (!symbolMap || visited.has(instName)) return
+        visited = new Set(visited)
+        visited.add(instName)
+        const symDoc = symbolMap.get(instName)
+        if (!symDoc) return
+        const layersEl = symDoc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
+        if (!layersEl) return
+        for (const layer of Array.from(layersEl.children).reverse()) {
+            const ltype = layer.getAttribute('layerType') ?? 'normal'
+            if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
+            const frame = activeFrame(layer, firstFrame)
+            if (!frame) continue
+            const elements = childByLocalName(frame, 'elements')
+            if (!elements) continue
+            for (const elem of elements.children) {
+                const ln = elem.localName
+                if (ln === 'DOMShape') {
+                    const shapeMat = readMatrix(elem)
+                    const effMat   = isIdentity(parentMat) ? shapeMat
+                        : isIdentity(shapeMat)  ? parentMat
+                        : composeMat(parentMat, shapeMat)
+                    const { fillMap, strokeMap } = shapeToRegions(elem, effMat)
+                    for (const { fill, segs }         of fillMap.values())   if (segs.length) out.push({ type: 'fill',   fill, segs })
+                    for (const { color, width, segs } of strokeMap.values()) if (segs.length) out.push({ type: 'stroke', color, width, segs })
+                } else if (ln === 'DOMGroup') {
+                    collectGroupDirect(elem, parentMat, out)
+                } else if (ln === 'DOMSymbolInstance') {
+                    const childName  = elem.getAttribute('libraryItemName')
+                    if (!childName) continue
+                    const childMat   = readMatrix(elem)
+                    const childFirst = parseInt(elem.getAttribute('firstFrame') ?? '0')
+                    const finalMat   = isIdentity(parentMat) ? childMat : composeMat(parentMat, childMat)
+                    collectSymFlat(childName, finalMat, childFirst, out, visited)
+                }
+            }
+        }
+    }
+
     // Collect all direct regions from a single layer frame.
-    function layerRegions(layer) {
+    // flattenInstances=true: DOMSymbolInstances are recursively flattened into
+    //   geometry — used for mask layers whose shapes may be library symbols.
+    // flattenInstances=false (default): symbol instances are skipped because
+    //   they become separate hierarchy children and must not be double-rendered.
+    function layerRegions(layer, flattenInstances = false) {
         const frame = activeFrame(layer, frameNum)
         if (!frame) return []
         const elements = childByLocalName(frame, 'elements')
@@ -348,14 +395,22 @@ function collectDirectRegions(doc, frameNum) {
                 for (const { color, width, segs } of strokeMap.values()) if (segs.length) out.push({ type: 'stroke', color, width, segs })
             } else if (ln === 'DOMGroup') {
                 collectGroupDirect(elem, IDENTITY, out)
+            } else if (ln === 'DOMSymbolInstance' && flattenInstances) {
+                const instName  = elem.getAttribute('libraryItemName')
+                if (!instName) continue
+                const instMat   = readMatrix(elem)
+                const instFirst = parseInt(elem.getAttribute('firstFrame') ?? '0')
+                collectSymFlat(instName, instMat, instFirst, out)
             }
-            // DOMSymbolInstance: skip — becomes a child instance in the hierarchy
         }
         return out
     }
 
-    const groups      = []
-    let plainRegions  = []
+    const groups     = []
+    let plainRegions = []
+    // Tracks the frontmost (lowest) layer index that contributed to the current
+    // plain batch — used to assign an order value comparable to child instance orders.
+    let plainFrontI  = -1
 
     // Iterate layers back-to-front (reversed from Flash's front-to-back XML order).
     for (let i = allLayers.length - 1; i >= 0; i--) {
@@ -367,29 +422,40 @@ function collectDirectRegions(doc, frameNum) {
         if (ltype === 'mask' && maskGroups.has(i)) {
             // Finalize any accumulated plain regions before the mask group.
             if (plainRegions.length) {
-                groups.push({ type: 'plain', regions: plainRegions })
+                groups.push({ type: 'plain', regions: plainRegions, order: allLayers.length - plainFrontI })
                 plainRegions = []
+                plainFrontI  = -1
             }
 
-            const maskRegions    = layerRegions(layer)
+            const maskRegions    = layerRegions(layer, true)  // flatten symbol instances into mask geometry
             const contentRegions = []
             // Masked layers are front-to-back in maskGroups; reverse for back-to-front rendering.
             for (const mi of [...maskGroups.get(i)].reverse()) {
                 contentRegions.push(...layerRegions(allLayers[mi]))
             }
 
-            if (maskRegions.length && contentRegions.length) {
-                groups.push({ type: 'masked', maskRegions, contentRegions })
+            const maskName    = allLayers[i].getAttribute('name') ?? i
+            const contentIdxs = maskGroups.get(i).join(',')
+            if (maskRegions.length) {
+                // Keep masked group even if contentRegions is empty — hierarchy children
+                // tagged with maskedByLayerIdx will be drawn inside this mask at render time.
+                console.log(`[mask] ${symName} — layer "${maskName}" (${i}) → ${maskRegions.length} mask regions, ${contentRegions.length} content regions  [content layers: ${contentIdxs}]`)
+                groups.push({ type: 'masked', maskRegions, contentRegions, maskLayerIdx: i, order: allLayers.length - i })
             } else {
-                // Degenerate — render content unmasked (matches FLA-RE behaviour).
+                console.warn(`[mask] ${symName} — layer "${maskName}" (${i}) DEGENERATE (no mask geometry): contentR=${contentRegions.length} — rendering unmasked  [content layers: ${contentIdxs}]`)
                 plainRegions.push(...contentRegions)
+                if (contentRegions.length) plainFrontI = i
             }
         } else {
-            plainRegions.push(...layerRegions(layer))
+            const regs = layerRegions(layer)
+            if (regs.length) {
+                plainRegions.push(...regs)
+                plainFrontI = i   // loop decreases → this stays at the minimum (frontmost) i
+            }
         }
     }
 
-    if (plainRegions.length) groups.push({ type: 'plain', regions: plainRegions })
+    if (plainRegions.length) groups.push({ type: 'plain', regions: plainRegions, order: allLayers.length - plainFrontI })
     return groups
 }
 
@@ -544,25 +610,34 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
         const key = `${name}@@${fn}`
         if (symbolGeometry.has(key)) return
         const doc = symbolMap.get(name)
-        symbolGeometry.set(key, doc ? collectDirectRegions(doc, fn) : [])
+        symbolGeometry.set(key, doc ? collectDirectRegions(doc, fn, symbolMap) : [])
     }
 
-    function buildNode(symbolName, rawMatrix, order, label, visited, fn) {
+    function buildNode(symbolName, rawMatrix, order, label, visited, fn, maskedByLayerIdx = null) {
         ensureGeometry(symbolName, fn)
-        if (visited.has(symbolName)) return { symbolName, frameNum: fn, rawMatrix, order, label, children: [] }
+        if (visited.has(symbolName)) return { symbolName, frameNum: fn, rawMatrix, order, label, children: [], maskedByLayerIdx }
         visited = new Set(visited)
         visited.add(symbolName)
 
         const doc = symbolMap.get(symbolName)
-        if (!doc) return { symbolName, rawMatrix, order, label, children: [] }
+        if (!doc) return { symbolName, rawMatrix, order, label, children: [], maskedByLayerIdx }
 
         const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
-        if (!layersElem) return { symbolName, rawMatrix, order, label, children: [] }
+        if (!layersElem) return { symbolName, rawMatrix, order, label, children: [], maskedByLayerIdx }
 
         const allLayers = Array.from(layersElem.children)
         const children  = []
 
-        function collectInstances(elems, groupAccMat, renderOrder) {
+        // Build content-layer → mask-layer-index mapping (mirrors collectDirectRegions).
+        const maskGroupOf = new Map()  // contentLayerIdx → maskLayerIdx
+        for (let i = 0; i < allLayers.length; i++) {
+            const ps = allLayers[i].getAttribute('parentLayerIndex')
+            if (ps === null) continue
+            const pi = parseInt(ps)
+            if (allLayers[pi]?.getAttribute('layerType') === 'mask') maskGroupOf.set(i, pi)
+        }
+
+        function collectInstances(elems, groupAccMat, renderOrder, layerMaskIdx) {
             for (const elem of elems) {
                 if (elem.localName === 'DOMSymbolInstance') {
                     const childName = elem.getAttribute('libraryItemName')
@@ -571,12 +646,12 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
                     const finalMat = isIdentity(groupAccMat) ? iMat : composeMat(groupAccMat, iMat)
                     const ff       = parseInt(elem.getAttribute('firstFrame') ?? '0')
                     const lbl      = childName.split('/').pop().replace(/^~/, '')
-                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, ff))
+                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, ff, layerMaskIdx))
                 } else if (elem.localName === 'DOMGroup') {
                     const gMat    = readMatrix(elem)
                     const newAcc  = isIdentity(gMat) ? groupAccMat : composeMat(groupAccMat, gMat)
                     const members = childByLocalName(elem, 'members')
-                    if (members) collectInstances(Array.from(members.children), newAcc, renderOrder)
+                    if (members) collectInstances(Array.from(members.children), newAcc, renderOrder, layerMaskIdx)
                 }
             }
         }
@@ -590,12 +665,13 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
             const elements = childByLocalName(frame, 'elements')
             if (!elements) continue
 
-            const renderOrder = allLayers.length - i
-            collectInstances(Array.from(elements.children), IDENTITY, renderOrder)
+            const renderOrder  = allLayers.length - i
+            const layerMaskIdx = maskGroupOf.get(i) ?? null
+            collectInstances(Array.from(elements.children), IDENTITY, renderOrder, layerMaskIdx)
         }
 
         children.sort((a, b) => a.order - b.order)
-        return { symbolName, frameNum: fn, rawMatrix, order, label, children }
+        return { symbolName, frameNum: fn, rawMatrix, order, label, children, maskedByLayerIdx }
     }
 
     const rootLabel = rootName.split('/').pop().replace(/^~/, '')

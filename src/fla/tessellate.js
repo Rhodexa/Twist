@@ -275,12 +275,12 @@ function tessellateGroups(groups) {
     for (const g of groups) {
         if (g.type === 'plain') {
             const meshes = tessellateAll(g.regions)
-            if (meshes.length) result.push({ type: 'plain', meshes })
+            if (meshes.length) result.push({ type: 'plain', meshes, order: g.order ?? 0 })
         } else {
             const maskMeshes    = tessellateAll(g.maskRegions)
             const contentMeshes = tessellateAll(g.contentRegions)
-            if (maskMeshes.length || contentMeshes.length)
-                result.push({ type: 'masked', maskMeshes, contentMeshes })
+            if (maskMeshes.length)  // keep even when contentMeshes is empty — hierarchy children provide content
+                result.push({ type: 'masked', maskMeshes, contentMeshes, maskLayerIdx: g.maskLayerIdx, order: g.order ?? 0 })
         }
     }
     return result

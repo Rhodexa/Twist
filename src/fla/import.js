@@ -77,12 +77,13 @@ function _buildSnapshot(symbolMap, rootName, frameNum) {
         if (!symId) return
         const instId = `inst_fla_${++_importCounter}`
         instances.push({
-            id:        instId,
-            symbolId:  symId,
-            label:     node.label,
-            parentId:  parentInstId,
-            order:     node.order,
-            rawMatrix: node.rawMatrix,
+            id:               instId,
+            symbolId:         symId,
+            label:            node.label,
+            parentId:         parentInstId,
+            order:            node.order,
+            rawMatrix:        node.rawMatrix,
+            maskedByLayerIdx: node.maskedByLayerIdx ?? null,
             transform: {
                 x: node.rawMatrix[4],  y: node.rawMatrix[5],
                 rotation: 0,  scaleX: node.rawMatrix[0],  scaleY: node.rawMatrix[3],
