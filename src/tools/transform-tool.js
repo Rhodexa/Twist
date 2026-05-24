@@ -16,13 +16,13 @@ import viewport from '../ui/viewport.js'
 
 // ── State ─────────────────────────────────────────────────────────────────
 
-let _active         = false
-let _mode           = null    // 'g' | 'r' | 's'
-let _axis           = null    // null | 'x' | 'y'
-let _instanceId     = null
-let _startTransform = null    // snapshot taken at activation
-let _refScreen      = null    // screen-px reference point (resets on axis change)
-let _currentValue   = null    // display string shown in overlay
+let _active          = false
+let _mode            = null    // 'g' | 'r' | 's'
+let _axis            = null    // null | 'x' | 'y'
+let _instanceId      = null
+let _startTransforms = new Map()   // instId → transform snapshot (all selected)
+let _refScreen       = null    // screen-px reference point (resets on axis change)
+let _currentValue    = null    // display string shown in overlay
 
 // ── rawMatrix decomposition ───────────────────────────────────────────────
 // FLA-imported instances store a Flash affine matrix [a,b,c,d,tx,ty]
@@ -51,17 +51,25 @@ function _activate(mode) {
     const inst = scene.instances.find(i => i.id === id)
     if (!inst) return
 
-    _decomposeRawMatrix(inst)
+    // Decompose rawMatrix for all selected instances before snapshotting
+    for (const selId of viewport.selectionIds) {
+        const selInst = scene.instances.find(i => i.id === selId)
+        if (selInst) _decomposeRawMatrix(selInst)
+    }
 
-    _active         = true
-    _mode           = mode
-    _axis           = null
-    _instanceId     = id
-    _startTransform = { ...inst.transform }
-    _refScreen      = null    // capture on first pointermove
-    _currentValue   = ''
+    _active      = true
+    _mode        = mode
+    _axis        = null
+    _instanceId  = id
+    _startTransforms.clear()
+    for (const selId of viewport.selectionIds) {
+        const selInst = scene.instances.find(i => i.id === selId)
+        if (selInst) _startTransforms.set(selId, { ...selInst.transform })
+    }
+    _refScreen   = null    // capture on first pointermove
+    _currentValue = ''
     // Get world origin now (before any transform changes) for R/S pivot.
-    _pivotWorld     = viewport.getWorldOrigin(id) ?? { x: inst.transform.x, y: inst.transform.y }
+    _pivotWorld  = viewport.getWorldOrigin(id) ?? { x: inst.transform.x, y: inst.transform.y }
 
     viewport.setToolActive(true)
     viewport.canvas.style.cursor = 'crosshair'
@@ -78,8 +86,10 @@ function _confirm() {
 
 function _cancel() {
     if (!_active) return
-    const inst = scene.instances.find(i => i.id === _instanceId)
-    if (inst) Object.assign(inst.transform, _startTransform)
+    for (const [id, startT] of _startTransforms) {
+        const inst = scene.instances.find(i => i.id === id)
+        if (inst) Object.assign(inst.transform, startT)
+    }
     _active = false; _pivotWorld = null
     viewport.setToolActive(false)
     viewport.canvas.style.cursor = ''
@@ -101,58 +111,63 @@ let _pivotWorld = null   // { x, y } world coords of instance origin
 
 function _apply(cur) {
     if (!_refScreen) { _refScreen = cur; return }
-
-    const inst = scene.instances.find(i => i.id === _instanceId)
-    if (!inst) return
+    if (_startTransforms.size === 0) return
 
     if (_mode === 'g') {
         const startW = viewport.screenToWorld(_refScreen.x, _refScreen.y)
         const curW   = viewport.screenToWorld(cur.x, cur.y)
         let wdx = curW.x - startW.x
         let wdy = curW.y - startW.y
-        // Axis constraint is applied in world space (matches screen axes).
         if (_axis === 'x') wdy = 0
         if (_axis === 'y') wdx = 0
-        // For child instances transform.x/y is in parent-local space, so we
-        // must convert the world-space delta through the parent's inverse matrix.
-        if (inst.parentId) {
-            const ld = viewport.worldDeltaToLocal(inst.parentId, wdx, wdy)
-            wdx = ld.x;  wdy = ld.y
+        for (const [selId, startT] of _startTransforms) {
+            const selInst = scene.instances.find(i => i.id === selId)
+            if (!selInst) continue
+            if (selInst.parentId) {
+                const ld = viewport.worldDeltaToLocal(selInst.parentId, wdx, wdy)
+                selInst.transform.x = startT.x + ld.x
+                selInst.transform.y = startT.y + ld.y
+            } else {
+                selInst.transform.x = startT.x + wdx
+                selInst.transform.y = startT.y + wdy
+            }
         }
-        inst.transform.x = _startTransform.x + wdx
-        inst.transform.y = _startTransform.y + wdy
         _currentValue = _axis
             ? `${_axis.toUpperCase()}: ${(_axis === 'x' ? wdx : wdy).toFixed(1)}`
             : `Δ ${wdx.toFixed(1)}, ${wdy.toFixed(1)}`
 
     } else if (_mode === 'r') {
-        // Pivot = instance's world-space origin (registration point from Flash).
-        const pivotW = _pivotWorld ?? { x: _startTransform.x, y: _startTransform.y }
+        const activeStartT = _startTransforms.get(_instanceId)
+        const pivotW = _pivotWorld ?? { x: activeStartT?.x ?? 0, y: activeStartT?.y ?? 0 }
         const pivotS = viewport.worldToScreen(pivotW.x, pivotW.y)
         const a0 = Math.atan2(_refScreen.y - pivotS.y, _refScreen.x - pivotS.x)
-        const a1 = Math.atan2(cur.y      - pivotS.y, cur.x       - pivotS.x)
+        const a1 = Math.atan2(cur.y - pivotS.y, cur.x - pivotS.x)
         const delta = a1 - a0
-        inst.transform.rotation = _startTransform.rotation + delta
+        for (const [selId, startT] of _startTransforms) {
+            const selInst = scene.instances.find(i => i.id === selId)
+            if (selInst) selInst.transform.rotation = startT.rotation + delta
+        }
         _currentValue = `${(delta * 180 / Math.PI).toFixed(1)}°`
 
     } else if (_mode === 's') {
-        const pivotW = _pivotWorld ?? { x: _startTransform.x, y: _startTransform.y }
+        const activeStartT = _startTransforms.get(_instanceId)
+        const pivotW = _pivotWorld ?? { x: activeStartT?.x ?? 0, y: activeStartT?.y ?? 0 }
         const pivotS = viewport.worldToScreen(pivotW.x, pivotW.y)
         const dx0 = _refScreen.x - pivotS.x,  dy0 = _refScreen.y - pivotS.y
         const len0 = Math.hypot(dx0, dy0)
         if (len0 < 1) return
-        // Signed projection onto the reference direction — allows negative scale
-        // (flip) when dragging past the pivot.
         const ux     = dx0 / len0,  uy = dy0 / len0
         const signed = (cur.x - pivotS.x) * ux + (cur.y - pivotS.y) * uy
         const factor = signed / len0
-        if (_axis === 'x') {
-            inst.transform.scaleX = _startTransform.scaleX * factor
-        } else if (_axis === 'y') {
-            inst.transform.scaleY = _startTransform.scaleY * factor
-        } else {
-            inst.transform.scaleX = _startTransform.scaleX * factor
-            inst.transform.scaleY = _startTransform.scaleY * factor
+        for (const [selId, startT] of _startTransforms) {
+            const selInst = scene.instances.find(i => i.id === selId)
+            if (!selInst) continue
+            if (_axis === 'x')      selInst.transform.scaleX = startT.scaleX * factor
+            else if (_axis === 'y') selInst.transform.scaleY = startT.scaleY * factor
+            else {
+                selInst.transform.scaleX = startT.scaleX * factor
+                selInst.transform.scaleY = startT.scaleY * factor
+            }
         }
         _currentValue = _axis
             ? `${_axis.toUpperCase()}: ×${factor.toFixed(3)}`

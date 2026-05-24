@@ -4,8 +4,8 @@ const scene = {
     camera: {
         x:      0,
         y:      0,
-        width:  1920,
-        height: 1080,
+        width:  856,
+        height: 480,
         output: { w: 1920, h: 1080 }
     },
 

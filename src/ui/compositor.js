@@ -2,7 +2,7 @@
 // Shows the render hierarchy: instances, symbol render groups (plain/masked),
 // and which children are masked by which group vs. left unmasked.
 // Use this to diagnose mask issues: if an instance is missing from under its
-// expected ◈ group, the bug is in parser maskedByLayerIdx assignment or
+// expected ◈ group, the bug is in import.js maskId resolution or
 // in the symbol's renderGroups mask detection.
 
 import scene    from '../scene/scene.js'
@@ -46,16 +46,16 @@ function _renderInst(inst, childrenOf) {
     const groups = sym?.renderGroups ?? []
 
     // Partition children into masked groups vs. unmasked — identical to viewport.
-    const knownMaskIdxs = new Set(
-        groups.filter(g => g.type === 'masked').map(g => g.maskLayerIdx)
+    const knownMaskIds = new Set(
+        groups.filter(g => g.type === 'masked').map(g => g.maskId)
     )
     const maskedByGroup = new Map()
     const unmaskedKids  = []
     for (const child of (childrenOf.get(inst.id) ?? [])) {
-        const ml = child.maskedByLayerIdx
-        if (ml != null && knownMaskIdxs.has(ml)) {
-            if (!maskedByGroup.has(ml)) maskedByGroup.set(ml, [])
-            maskedByGroup.get(ml).push(child)
+        const mk = child.maskId
+        if (mk != null && knownMaskIds.has(mk)) {
+            if (!maskedByGroup.has(mk)) maskedByGroup.set(mk, [])
+            maskedByGroup.get(mk).push(child)
         } else {
             unmaskedKids.push(child)
         }
@@ -69,7 +69,7 @@ function _renderInst(inst, childrenOf) {
     node.className = 'ct-node'
 
     // Instance header row
-    const maskTag = inst.maskedByLayerIdx != null ? `→ L${inst.maskedByLayerIdx}` : null
+    const maskTag = inst.maskId != null ? `→ ${inst.maskId}` : null
     const instRow = _row(
         'ct-inst',
         hasBody ? (isOpen ? '▾' : '▸') : '·',
@@ -102,16 +102,16 @@ function _renderInst(inst, childrenOf) {
         } else {
             const mk   = g.maskMeshes?.length   ?? 0
             const ck   = g.contentMeshes?.length ?? 0
-            const kids = maskedByGroup.get(g.maskLayerIdx) ?? []
+            const kids = maskedByGroup.get(g.maskId) ?? []
             const row  = _row(
                 'ct-group-masked',
                 '◈',
-                `mask  L${g.maskLayerIdx}`,
+                `mask  ${g.maskId}`,
                 `${mk}m · ${ck}c · ${kids.length}i`
             )
             // Warn if no mask geometry — mask will be invisible (nothing clips)
             if (mk === 0) row.classList.add('ct-warn')
-            row.addEventListener('mouseenter', () => viewport.setHoverHighlight(inst.id, g.maskLayerIdx))
+            row.addEventListener('mouseenter', () => viewport.setHoverHighlight(inst.id, g.maskId))
             row.addEventListener('mouseleave', () => viewport.setHoverHighlight(null))
             body.appendChild(row)
 

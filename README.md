@@ -29,3 +29,6 @@ The python tools in there, render frames to almost* perfection for all .fla we h
 --- 
 Director:
 I will be here to help you, and you can ask me any question or to help you debug stuff at any time.
+
+
+Twist is MIT-licensed and MUST include only MIT-compatible libs.

@@ -76,6 +76,17 @@ function getInstanceWorldMat(inst, frame) {
     return mat
 }
 
+function _worldDeltaToLocal(parentInstId, wdx, wdy) {
+    const parent = scene.instances.find(i => i.id === parentInstId)
+    if (!parent) return { x: wdx, y: wdy }
+    const m   = getInstanceWorldMat(parent, scene.timeline.currentFrame)
+    const inv = invertMat3(m)
+    if (!inv) return { x: wdx, y: wdy }
+    const p0 = applyMat3(inv, 0,   0  )
+    const pd = applyMat3(inv, wdx, wdy)
+    return { x: pd.x - p0.x, y: pd.y - p0.y }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function cssVarToGL(varName) {
@@ -198,6 +209,12 @@ function getSymbolLocalAABB(symbol) {
     return { minX, minY, maxX, maxY }
 }
 
+function _hasOwnGeometry(inst) {
+    const sym = scene.symbols.find(s => s.id === inst.symbolId)
+    if (!sym) return false
+    return getSymbolLocalAABB(sym).minX !== Infinity
+}
+
 function hitTestInstance(wx, wy, instance) {
     if (instance.parentId) return false
     const sym = scene.symbols.find(s => s.id === instance.symbolId)
@@ -213,8 +230,11 @@ function hitTestInstance(wx, wy, instance) {
 }
 
 // ── Selection state ───────────────────────────────────────────────────────
+// Multi-selection: a Set of selected IDs + one "active" (most-recently picked).
+// activeId is what the transform tool and pivot calculations use.
 
-let selectedId = null
+const _selection = new Set()   // all selected instance IDs
+let   _activeId  = null        // last clicked — "active" object
 
 // ── External tool state ───────────────────────────────────────────────────
 
@@ -222,14 +242,66 @@ let _externalToolActive = false
 
 const _overlayHooks = []
 
+// ── Context-based selection ───────────────────────────────────────────────
+// Single click picks direct children of the current context (null = root).
+// Double-click enters the selected instance. Escape walks back up.
+// Repeated clicks at the same spot cycle siblings at the current level.
+
+let _selectionCtx  = null   // ID of the "entered" instance (null = root level)
+let _ctxStack      = []     // stack of ancestor IDs for Alt/Escape to walk up
+
+const _CYCLE_RADIUS_PX = 8
+
+let _cycleIds      = []
+let _cycleIndex    = 0
+let _cycleScreenXY = null
+
+// Returns true if the subtree rooted at instId (with known worldMat) contains
+// the world-space point (wx, wy) — either in its own AABB or any descendant.
+function _subtreeHitsPoint(inst, worldMat, wx, wy, frame) {
+    const sym = scene.symbols.find(s => s.id === inst.symbolId)
+    if (sym) {
+        const aabb = getSymbolLocalAABB(sym)
+        if (aabb.minX !== Infinity) {
+            const inv = invertMat3(worldMat)
+            if (inv) {
+                const local = applyMat3(inv, wx, wy)
+                if (local.x >= aabb.minX && local.x <= aabb.maxX &&
+                    local.y >= aabb.minY && local.y <= aabb.maxY) return true
+            }
+        }
+    }
+    for (const child of scene.instances.filter(i => i.parentId === inst.id)) {
+        const childWorld = composeMat3(worldMat, instanceLocalMat(child, frame, false, null))
+        if (_subtreeHitsPoint(child, childWorld, wx, wy, frame)) return true
+    }
+    return false
+}
+
+// Returns direct children of contextId whose subtree contains (wx, wy),
+// sorted front-to-back (highest draw order first).
+function _getContextHits(wx, wy, contextId) {
+    const frame    = scene.timeline.currentFrame
+    const children = scene.instances
+        .filter(i => (i.parentId ?? null) === contextId)
+        .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    const hits = []
+    for (const inst of children) {
+        const worldMat = getInstanceWorldMat(inst, frame)
+        if (_subtreeHitsPoint(inst, worldMat, wx, wy, frame)) hits.push(inst)
+    }
+    hits.reverse()   // highest order (front) first
+    return hits
+}
+
 // ── Drag state ────────────────────────────────────────────────────────────
 
-let isDragging        = false
-let dragInstanceId    = null
-let dragStartWorld    = null
-let dragOldTransform  = null
-let dragStartClientX  = 0
-let dragStartClientY  = 0
+let isDragging          = false
+let dragInstanceId      = null
+let dragStartWorld      = null
+let dragStartTransforms = new Map()   // selId → { x, y } at drag start
+let dragStartClientX    = 0
+let dragStartClientY    = 0
 
 // ── Pan state ─────────────────────────────────────────────────────────────
 
@@ -266,43 +338,165 @@ function _stopPan(e) {
 
 // ── Tool state ────────────────────────────────────────────────────────────
 
+function _setActive(id) {
+    _activeId = id
+    if (id != null) _selection.add(id)
+    document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+    viewport.markDirty()
+}
+
 function _startTool(e) {
     if (_externalToolActive) return
     const rect = canvas.getBoundingClientRect()
-    const wx   = (e.clientX - rect.left - cssW / 2 - view.x) / view.zoom
-    const wy   = (e.clientY - rect.top  - cssH / 2 - view.y) / view.zoom
+    const sx   = e.clientX - rect.left
+    const sy   = e.clientY - rect.top
+    const wx   = (sx - cssW / 2 - view.x) / view.zoom
+    const wy   = (sy - cssH / 2 - view.y) / view.zoom
 
     dragStartClientX = e.clientX
     dragStartClientY = e.clientY
 
-    const hit = [...scene.instances].reverse().find(i => hitTestInstance(wx, wy, i))
+    const shift    = e.shiftKey
+    const sameSpot = _cycleScreenXY &&
+        Math.hypot(sx - _cycleScreenXY.x, sy - _cycleScreenXY.y) < _CYCLE_RADIUS_PX
 
-    if (hit) {
-        selectedId       = hit.id
-        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
-        isDragging       = true
-        dragInstanceId   = hit.id
-        dragStartWorld   = { x: wx, y: wy }
-        dragOldTransform = { ...hit.transform }
+    if (sameSpot && _cycleIds.length > 1 && !shift) {
+        _cycleIndex = (_cycleIndex + 1) % _cycleIds.length
+        _activeId   = _cycleIds[_cycleIndex]
+        _selection.clear(); _selection.add(_activeId)
+    } else {
+        const hits = _getContextHits(wx, wy, _selectionCtx)
+        _cycleIds  = hits.map(i => i.id)
+        _cycleIndex = 0
+        const picked = _cycleIds[0] ?? null
+
+        if (shift && picked) {
+            // Shift+click: toggle in/out of selection, update active
+            if (_selection.has(picked)) {
+                _selection.delete(picked)
+                _activeId = [..._selection].at(-1) ?? null
+            } else {
+                _selection.add(picked)
+                _activeId = picked
+            }
+        } else if (picked) {
+            _selection.clear()
+            _selection.add(picked)
+            _activeId = picked
+            _cycleScreenXY = { x: sx, y: sy }
+
+            // Auto-enter pure containers (no own geometry) — skip to selectable content
+            for (let depth = 0; depth < 6 && _activeId; depth++) {
+                const cand = scene.instances.find(i => i.id === _activeId)
+                if (!cand || _hasOwnGeometry(cand)) break
+                if (!scene.instances.some(i => i.parentId === _activeId)) break
+                _ctxStack.push(_selectionCtx)
+                _selectionCtx = _activeId
+                const inner = _getContextHits(wx, wy, _selectionCtx)
+                if (!inner.length) { _selectionCtx = _ctxStack.pop(); break }
+                _cycleIds      = inner.map(i => i.id)
+                _cycleIndex    = 0
+                _cycleScreenXY = { x: sx, y: sy }
+                _selection.clear()
+                _activeId = _cycleIds[0]
+                _selection.add(_activeId)
+            }
+        } else {
+            // Miss — clear selection and exit context
+            _selection.clear()
+            _activeId      = null
+            _selectionCtx  = null
+            _ctxStack      = []
+            _cycleIds      = []
+            _cycleScreenXY = null
+        }
+    }
+
+    document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+
+    // Drag all selected instances together
+    if (_activeId) {
+        isDragging     = true
+        dragInstanceId = _activeId
+        dragStartWorld = { x: wx, y: wy }
+        dragStartTransforms.clear()
+        for (const selId of _selection) {
+            const selInst = scene.instances.find(i => i.id === selId)
+            if (selInst) dragStartTransforms.set(selId, { x: selInst.transform.x, y: selInst.transform.y })
+        }
         canvas.setPointerCapture(e.pointerId)
     } else {
-        selectedId = null
-        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
         isDragging = false
     }
 
     viewport.markDirty()
 }
 
+// Double-click: enter the active instance (descend one level)
+canvas.addEventListener('dblclick', e => {
+    if (_externalToolActive || !_activeId) return
+    const hasChildren = scene.instances.some(i => i.parentId === _activeId)
+    if (!hasChildren) return
+    _ctxStack.push(_selectionCtx)
+    _selectionCtx  = _activeId
+    _cycleIds      = []
+    _cycleScreenXY = null
+    // Pick immediately at the same cursor position
+    const rect = canvas.getBoundingClientRect()
+    const sx   = e.clientX - rect.left
+    const sy   = e.clientY - rect.top
+    const wx   = (sx - cssW / 2 - view.x) / view.zoom
+    const wy   = (sy - cssH / 2 - view.y) / view.zoom
+    const hits = _getContextHits(wx, wy, _selectionCtx)
+    if (hits.length) {
+        _selection.clear(); _selection.add(hits[0].id)
+        _activeId      = hits[0].id
+        _cycleIds      = hits.map(i => i.id)
+        _cycleScreenXY = { x: sx, y: sy }
+    }
+    document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+    viewport.markDirty()
+})
+
+// Escape (when no modal tool active): walk up one context level
+window.addEventListener('keydown', e => {
+    if (_externalToolActive) return
+    if (e.code !== 'Escape' && e.code !== 'AltLeft' && e.code !== 'AltRight') return
+    if (e.code === 'Escape' || e.code === 'AltLeft' || e.code === 'AltRight') {
+        if (_selectionCtx === null) return
+        e.preventDefault()
+        const parent   = _ctxStack.pop() ?? null
+        const wasCtx   = _selectionCtx
+        _selectionCtx  = parent
+        _cycleIds      = []
+        _cycleScreenXY = null
+        // Re-select the instance we were inside
+        _selection.clear(); _selection.add(wasCtx)
+        _activeId = wasCtx
+        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+        viewport.markDirty()
+    }
+})
+
 function _moveTool(e) {
     if (!isDragging) return
     const rect = canvas.getBoundingClientRect()
-    const wx   = (e.clientX - rect.left - cssW / 2 - view.x) / view.zoom
-    const wy   = (e.clientY - rect.top  - cssH / 2 - view.y) / view.zoom
-    const inst = scene.instances.find(i => i.id === dragInstanceId)
-    if (!inst) return
-    inst.transform.x = dragOldTransform.x + (wx - dragStartWorld.x)
-    inst.transform.y = dragOldTransform.y + (wy - dragStartWorld.y)
+    const wx  = (e.clientX - rect.left - cssW / 2 - view.x) / view.zoom
+    const wy  = (e.clientY - rect.top  - cssH / 2 - view.y) / view.zoom
+    const dwx = wx - dragStartWorld.x
+    const dwy = wy - dragStartWorld.y
+    for (const [id, startPos] of dragStartTransforms) {
+        const inst = scene.instances.find(i => i.id === id)
+        if (!inst) continue
+        if (inst.parentId) {
+            const ld = _worldDeltaToLocal(inst.parentId, dwx, dwy)
+            inst.transform.x = startPos.x + ld.x
+            inst.transform.y = startPos.y + ld.y
+        } else {
+            inst.transform.x = startPos.x + dwx
+            inst.transform.y = startPos.y + dwy
+        }
+    }
     viewport.markDirty()
 }
 
@@ -312,13 +506,15 @@ function _stopTool(e) {
 
     const moved = Math.hypot(e.clientX - dragStartClientX, e.clientY - dragStartClientY)
     if (moved > 3) {
-        const inst = scene.instances.find(i => i.id === dragInstanceId)
-        if (inst) {
-            const newT = { ...inst.transform }
-            const oldT = dragOldTransform
+        const changes = []
+        for (const [id, oldPos] of dragStartTransforms) {
+            const inst = scene.instances.find(i => i.id === id)
+            if (inst) changes.push({ inst, newX: inst.transform.x, newY: inst.transform.y, oldX: oldPos.x, oldY: oldPos.y })
+        }
+        if (changes.length) {
             journal.push({
-                execute: () => { inst.transform.x = newT.x; inst.transform.y = newT.y },
-                undo:    () => { inst.transform.x = oldT.x; inst.transform.y = oldT.y }
+                execute: () => { for (const c of changes) { c.inst.transform.x = c.newX; c.inst.transform.y = c.newY } },
+                undo:    () => { for (const c of changes) { c.inst.transform.x = c.oldX; c.inst.transform.y = c.oldY } }
             })
         }
     }
@@ -375,7 +571,7 @@ let _uniforms    = null
 const _symbolVaos = new Map()
 const _edgeVaos   = new Map()
 
-// Compositor hover highlight — null | { instId, maskLayerIdx? }
+// Compositor hover highlight — null | { instId, maskId? }
 let _hoverHighlight = null
 const _HIGHLIGHT_INST = new Float32Array([0.0, 0.85, 1.0, 0.30])   // cyan
 const _HIGHLIGHT_MASK = new Float32Array([1.0, 0.20, 0.85, 0.55])   // magenta
@@ -409,10 +605,32 @@ const viewport = {
     gl, canvas, overlay, ctx2d,
     view, worldToScreen, screenToWorld, fitCamera,
 
-    get cssWidth()    { return cssW },
-    get cssHeight()   { return cssH },
-    get selectedId()  { return selectedId },
-    setSelected(id)   { selectedId = id; this.markDirty() },
+    get cssWidth()     { return cssW },
+    get cssHeight()    { return cssH },
+    get selectedId()   { return _activeId },           // backward compat (transform-tool)
+    get activeId()     { return _activeId },
+    get selectionIds() { return _selection },           // Set — read-only by convention
+    isSelected(id)     { return _selection.has(id) },
+    setSelected(id) {
+        _selection.clear()
+        _activeId = id ?? null
+        if (id != null) _selection.add(id)
+        _selectionCtx = null; _ctxStack = []; _cycleIds = []; _cycleScreenXY = null
+        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+        this.markDirty()
+    },
+    // Add or remove from multi-selection without clearing the rest.
+    toggleSelected(id) {
+        if (_selection.has(id)) {
+            _selection.delete(id)
+            if (_activeId === id) _activeId = [..._selection].at(-1) ?? null
+        } else {
+            _selection.add(id)
+            _activeId = id
+        }
+        document.dispatchEvent(new CustomEvent('twist:selectionChanged'))
+        this.markDirty()
+    },
     setToolActive(v)  { _externalToolActive = v },
     addOverlayHook(fn){ _overlayHooks.push(fn) },
 
@@ -424,18 +642,11 @@ const viewport = {
     },
 
     worldDeltaToLocal(parentInstId, wdx, wdy) {
-        const parent = scene.instances.find(i => i.id === parentInstId)
-        if (!parent) return { x: wdx, y: wdy }
-        const m   = getInstanceWorldMat(parent, scene.timeline.currentFrame)
-        const inv = invertMat3(m)
-        if (!inv) return { x: wdx, y: wdy }
-        const p0 = applyMat3(inv, 0,   0  )
-        const pd = applyMat3(inv, wdx, wdy)
-        return { x: pd.x - p0.x, y: pd.y - p0.y }
+        return _worldDeltaToLocal(parentInstId, wdx, wdy)
     },
 
-    setHoverHighlight(instId, maskLayerIdx = null) {
-        _hoverHighlight = instId ? { instId, maskLayerIdx } : null
+    setHoverHighlight(instId, maskId = null) {
+        _hoverHighlight = instId ? { instId, maskId } : null
         this.markDirty()
     },
 
@@ -498,11 +709,11 @@ const viewport = {
                     return { type: 'plain', order: g.order ?? 0, vaos: g.meshes.map(meshToEntry) }
                 }
                 return {
-                    type:         'masked',
-                    order:        g.order ?? 0,
-                    maskLayerIdx: g.maskLayerIdx,
-                    maskVaos:     g.maskMeshes.map(m => makeVao(m.vertices)),
-                    contentVaos:  g.contentMeshes.map(meshToEntry),
+                    type:        'masked',
+                    order:       g.order ?? 0,
+                    maskId:      g.maskId,
+                    maskVaos:    g.maskMeshes.map(m => makeVao(m.vertices)),
+                    contentVaos: g.contentMeshes.map(meshToEntry),
                 }
             }))
         } else if (sym.meshes?.length) {
@@ -644,22 +855,22 @@ const viewport = {
         }
 
         // Draw an instance and its full subtree.
-        // Hierarchy children tagged maskedByLayerIdx are drawn inside their parent's stencil;
-        // all others are drawn normally after the symbol's own render groups.
+        // Children with maskId matching one of the parent symbol's mask groups
+        // are drawn inside that stencil; all others are drawn normally after.
         const drawInstTree = (inst, worldMat) => {
             const groups = _symbolVaos.get(inst.symbolId)
 
             // Partition this instance's children by which mask group (if any) clips them.
-            const maskedByGroup = new Map()   // maskLayerIdx → [child, ...]
+            const maskedByGroup = new Map()   // maskId → [child, ...]
             const unmaskedKids  = []
-            const knownMaskIdxs = new Set(
-                groups?.filter(g => g.type === 'masked').map(g => g.maskLayerIdx) ?? []
+            const knownMaskIds  = new Set(
+                groups?.filter(g => g.type === 'masked').map(g => g.maskId) ?? []
             )
             for (const child of (childrenOf.get(inst.id) ?? [])) {
-                const ml = child.maskedByLayerIdx
-                if (ml != null && knownMaskIdxs.has(ml)) {
-                    if (!maskedByGroup.has(ml)) maskedByGroup.set(ml, [])
-                    maskedByGroup.get(ml).push(child)
+                const mk = child.maskId
+                if (mk != null && knownMaskIds.has(mk)) {
+                    if (!maskedByGroup.has(mk)) maskedByGroup.set(mk, [])
+                    maskedByGroup.get(mk).push(child)
                 } else {
                     unmaskedKids.push(child)
                 }
@@ -681,7 +892,7 @@ const viewport = {
                     if (group.type === 'plain') {
                         for (const entry of group.vaos) drawEntry(entry, worldMat)
                     } else {
-                        const maskedKids = maskedByGroup.get(group.maskLayerIdx) ?? []
+                        const maskedKids = maskedByGroup.get(group.maskId) ?? []
                         pushMask(group, worldMat)
                         for (const cv of group.contentVaos) drawEntry(cv, worldMat)
                         for (const kid of maskedKids) {
@@ -715,9 +926,9 @@ const viewport = {
 
                 const groups = _symbolVaos.get(inst.symbolId)
 
-                if (_hoverHighlight.maskLayerIdx != null) {
+                if (_hoverHighlight.maskId != null) {
                     // Highlight just the mask shape for this mask group
-                    const group = groups?.find(g => g.type === 'masked' && g.maskLayerIdx === _hoverHighlight.maskLayerIdx)
+                    const group = groups?.find(g => g.type === 'masked' && g.maskId === _hoverHighlight.maskId)
                     if (group) {
                         gl.uniform4fv(_uniforms.color, _HIGHLIGHT_MASK)
                         for (const mv of group.maskVaos) {
@@ -821,30 +1032,62 @@ const viewport = {
         ctx2d.lineWidth   = 1
         ctx2d.strokeRect(Math.round(tl.x) + 0.5, Math.round(tl.y) + 0.5, Math.round(fw), Math.round(fh))
 
-        if (selectedId !== null) {
-            const inst = scene.instances.find(i => i.id === selectedId)
-            const sym  = inst && scene.symbols.find(s => s.id === inst.symbolId)
-            if (inst && sym) {
-                const worldMat = getInstanceWorldMat(inst, scene.timeline.currentFrame)
-                const aabb     = getSymbolLocalAABB(sym)
-                const corners = [
-                    { x: aabb.minX, y: aabb.minY },
-                    { x: aabb.maxX, y: aabb.minY },
-                    { x: aabb.maxX, y: aabb.maxY },
-                    { x: aabb.minX, y: aabb.maxY },
-                ].map(c => {
-                    const w = applyMat3(worldMat, c.x, c.y)
-                    return worldToScreen(w.x, w.y)
-                })
+        // ── Selection boxes ──────────────────────────────────────────────
+        const frame = scene.timeline.currentFrame
 
+        function drawSelBox(instId, isActive) {
+            const inst = scene.instances.find(i => i.id === instId)
+            const sym  = inst && scene.symbols.find(s => s.id === inst.symbolId)
+            if (!inst || !sym) return
+            const worldMat = getInstanceWorldMat(inst, frame)
+            const aabb     = getSymbolLocalAABB(sym)
+            if (aabb.minX === Infinity) return
+            const corners = [
+                { x: aabb.minX, y: aabb.minY }, { x: aabb.maxX, y: aabb.minY },
+                { x: aabb.maxX, y: aabb.maxY }, { x: aabb.minX, y: aabb.maxY },
+            ].map(c => { const w = applyMat3(worldMat, c.x, c.y); return worldToScreen(w.x, w.y) })
+
+            ctx2d.beginPath()
+            ctx2d.moveTo(corners[0].x, corners[0].y)
+            for (let i = 1; i < corners.length; i++) ctx2d.lineTo(corners[i].x, corners[i].y)
+            ctx2d.closePath()
+            ctx2d.strokeStyle = isActive ? 'rgba(255,200,50,0.9)' : 'rgba(255,140,30,0.65)'
+            ctx2d.lineWidth   = isActive ? 1.5 : 1
+            ctx2d.stroke()
+
+            if (isActive && _cycleIds.length > 1) {
+                // Cycle badge — pill background for legibility
+                const label  = `${_cycleIndex + 1} / ${_cycleIds.length}`
+                const ox = corners[1].x + 6
+                const oy = corners[1].y - 3
+                ctx2d.font = 'bold 11px monospace'
+                const tw   = ctx2d.measureText(label).width
+                ctx2d.fillStyle = 'rgba(0,0,0,0.7)'
                 ctx2d.beginPath()
-                ctx2d.moveTo(corners[0].x, corners[0].y)
-                for (let i = 1; i < corners.length; i++) ctx2d.lineTo(corners[i].x, corners[i].y)
-                ctx2d.closePath()
-                ctx2d.strokeStyle = 'rgba(255, 200, 50, 0.85)'
-                ctx2d.lineWidth   = 1.5
-                ctx2d.stroke()
+                ctx2d.roundRect(ox - 3, oy - 12, tw + 6, 15, 3)
+                ctx2d.fill()
+                ctx2d.fillStyle = 'rgba(255,200,50,1)'
+                ctx2d.fillText(label, ox, oy)
             }
+        }
+
+        // Draw non-active selected (orange) first so yellow active draws on top
+        for (const id of _selection) {
+            if (id !== _activeId) drawSelBox(id, false)
+        }
+        if (_activeId !== null) drawSelBox(_activeId, true)
+
+        // ── Context breadcrumb ───────────────────────────────────────────
+        if (_selectionCtx !== null) {
+            const ctxInst  = scene.instances.find(i => i.id === _selectionCtx)
+            const ctxLabel = ctxInst?.label ?? ctxInst?.id ?? '?'
+            const crumb    = `▸ ${ctxLabel}  (Esc to exit)`
+            ctx2d.font      = '11px monospace'
+            const tw        = ctx2d.measureText(crumb).width
+            ctx2d.fillStyle = 'rgba(0,0,0,0.65)'
+            ctx2d.fillRect(10, 36, tw + 12, 18)
+            ctx2d.fillStyle = 'rgba(255,180,40,0.9)'
+            ctx2d.fillText(crumb, 16, 49)
         }
 
         ctx2d.restore()

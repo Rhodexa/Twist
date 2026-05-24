@@ -35,18 +35,25 @@ function _getSymbol(key, renderGroups) {
     if (!_symbolObjs.has(uid)) {
         const name = key.split('@@')[0]
 
-        // Flatten all regions across groups for the edge-contour wireframe.
         const allRegions = renderGroups.flatMap(g =>
             g.type === 'plain'
                 ? g.regions
                 : [...g.maskRegions, ...g.contentRegions]
         )
 
+        const tessGroups = tessellateGroups(renderGroups)
+        // Assign stable Twist maskIds to masked groups.
+        // maskLayerIdx (FLA-internal) is kept temporarily so flattenNode can
+        // resolve instance.maskedByLayerIdx → maskId; stripped after all frames build.
+        for (const g of tessGroups) {
+            if (g.type === 'masked') g.maskId = `mask_fla_${++_importCounter}`
+        }
+
         _symbolObjs.set(uid, {
             id:           uid,
             name,
             label:        name.split('/').pop().replace(/^~/, ''),
-            renderGroups: tessellateGroups(renderGroups),
+            renderGroups: tessGroups,
             edgeContours: extractEdgeContours(allRegions),
         })
     }
@@ -72,27 +79,39 @@ function _buildSnapshot(symbolMap, rootName, frameNum) {
     }
 
     const instances = []
-    function flattenNode(node, parentInstId) {
+    function flattenNode(node, parentInstId, parentSym) {
         const symId = symIdMap.get(`${node.symbolName}@@${node.frameNum ?? 0}`)
         if (!symId) return
+        const sym    = symbols.find(s => s.id === symId)
         const instId = `inst_fla_${++_importCounter}`
+
+        // Resolve FLA layer index → Twist maskId using parent symbol's render groups.
+        // maskedByLayerIdx is a Flash concept and must not survive past this point.
+        let maskId = null
+        if (node.maskedByLayerIdx != null && parentSym) {
+            const g = parentSym.renderGroups?.find(
+                g => g.type === 'masked' && g.maskLayerIdx === node.maskedByLayerIdx
+            )
+            maskId = g?.maskId ?? null
+        }
+
         instances.push({
-            id:               instId,
-            symbolId:         symId,
-            label:            node.label,
-            parentId:         parentInstId,
-            order:            node.order,
-            rawMatrix:        node.rawMatrix,
-            maskedByLayerIdx: node.maskedByLayerIdx ?? null,
+            id:        instId,
+            symbolId:  symId,
+            label:     node.label,
+            parentId:  parentInstId,
+            order:     node.order,
+            rawMatrix: node.rawMatrix,
+            maskId,
             transform: {
                 x: node.rawMatrix[4],  y: node.rawMatrix[5],
                 rotation: 0,  scaleX: node.rawMatrix[0],  scaleY: node.rawMatrix[3],
             },
             tracks: { x: [], y: [], rotation: [], scaleX: [], scaleY: [] },
         })
-        for (const child of node.children) flattenNode(child, instId)
+        for (const child of node.children) flattenNode(child, instId, sym)
     }
-    flattenNode(rootNode, null)
+    flattenNode(rootNode, null, null)
 
     return { symbols, instances }
 }
@@ -225,6 +244,11 @@ async function importFla() {
 
     for (let f = 0; f < frameCount; f++) {
         _frameSnapshots.push(_buildSnapshot(symbolMap, rootName, f))
+    }
+
+    // Strip FLA layer indices — they were only needed during import to resolve maskIds.
+    for (const sym of _symbolObjs.values()) {
+        for (const g of sym.renderGroups ?? []) delete g.maskLayerIdx
     }
 
     console.log(`[fla import] ready — ${_symbolObjs.size} unique symbols across ${frameCount} frame(s)`)

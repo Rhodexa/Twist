@@ -34,7 +34,6 @@ function collapseAll() {
 }
 
 function symbolLabel(inst) {
-    // Use instance label if set, otherwise fall back to symbol name
     if (inst.label) return inst.label
     const sym = scene.symbols.find(s => s.id === inst.symbolId)
     return sym?.label ?? sym?.name ?? inst.symbolId
@@ -50,21 +49,38 @@ function buildRows(childrenOf, parentId, depth, rows) {
 }
 
 function render() {
-    const selId      = viewport.selectedId
+    const activeId = viewport.activeId
+    const sel      = viewport.selectionIds   // Set
+
     const childrenOf = buildChildrenMap()
     const rows       = []
     buildRows(childrenOf, null, 0, rows)
 
     const frag = document.createDocumentFragment()
+    let activeRow = null
 
     for (const { inst, depth, hasChildren } of rows) {
+        const isActive   = inst.id === activeId
+        const isSelected = sel.has(inst.id)
+
         const row = document.createElement('div')
-        row.className = 'outliner-row' + (inst.id === selId ? ' selected' : '')
+        row.className  = 'outliner-row'
         row.dataset.id = inst.id
+
+        if (isActive) {
+            row.style.background = 'rgba(255,200,50,0.22)'
+            row.style.color      = 'rgba(255,200,50,1)'
+            row.style.outline    = '1px solid rgba(255,200,50,0.5)'
+            row.style.outlineOffset = '-1px'
+            activeRow = row
+        } else if (isSelected) {
+            row.style.background = 'rgba(255,140,30,0.18)'
+            row.style.color      = 'rgba(255,160,50,0.9)'
+        }
 
         // Indent
         const indent = document.createElement('span')
-        indent.className = 'outliner-indent'
+        indent.className   = 'outliner-indent'
         indent.style.width = `${depth * 14}px`
         row.appendChild(indent)
 
@@ -79,33 +95,36 @@ function render() {
                 render()
             })
         } else {
-            arrow.textContent = '●'
+            arrow.textContent  = '●'
             arrow.style.opacity = '0.35'
         }
         row.appendChild(arrow)
 
         // Label
         const label = document.createElement('span')
-        label.className = 'outliner-label'
+        label.className   = 'outliner-label'
         label.textContent = symbolLabel(inst)
         row.appendChild(label)
 
-        // Click → select
-        row.addEventListener('click', () => {
-            viewport.setSelected(inst.id)
-            render()
+        // Click: normal = setSelected, Shift = toggle in/out of multi-selection
+        row.addEventListener('click', e => {
+            if (e.shiftKey) viewport.toggleSelected(inst.id)
+            else            viewport.setSelected(inst.id)
         })
 
         frag.appendChild(row)
     }
 
     tree.replaceChildren(frag)
+
+    // Scroll active row into view without jarring jumps
+    if (activeRow) activeRow.scrollIntoView({ block: 'nearest' })
 }
 
 // ── DOM setup ─────────────────────────────────────────────────────────────
 
 const header = document.createElement('div')
-header.className = 'outliner-header'
+header.className   = 'outliner-header'
 header.style.cssText = 'display:flex;align-items:center;justify-content:space-between'
 
 const headerTitle = document.createElement('span')
@@ -134,7 +153,7 @@ panel.appendChild(tree)
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 function initOutliner() {
-    document.addEventListener('twist:sceneChanged',    collapseAll)
+    document.addEventListener('twist:sceneChanged',     collapseAll)
     document.addEventListener('twist:selectionChanged', render)
     collapseAll()   // start collapsed
 }
