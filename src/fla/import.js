@@ -7,7 +7,7 @@
 // once and reused across frames.
 
 import { buildSymbolMap, findRoots, parseHierarchy } from './parser.js'
-import { tessellateAll, extractEdgeContours } from './tessellate.js'
+import { tessellateGroups, extractEdgeContours }     from './tessellate.js'
 import scene    from '../scene/scene.js'
 import viewport from '../ui/viewport.js'
 
@@ -22,23 +22,32 @@ const _symbolObjs = new Map()   // uid → scene.symbol (tessellated once, share
 
 // ── Stable identity helpers ───────────────────────────────────────────────
 
-// Same (symbolName, frameNum) always gets the same uid within a file session.
 function _stableId(key) {
     if (!_symbolIds.has(key)) _symbolIds.set(key, `fla_${++_importCounter}`)
     return _symbolIds.get(key)
 }
 
-// Tessellate + cache. Returns an existing symbol object if already built.
-function _getSymbol(key, regions) {
+// Tessellate and cache a symbol from its render groups.
+// renderGroups is the output of collectDirectRegions — an array of
+// { type:'plain'|'masked', regions?, maskRegions?, contentRegions? }.
+function _getSymbol(key, renderGroups) {
     const uid = _stableId(key)
     if (!_symbolObjs.has(uid)) {
         const name = key.split('@@')[0]
+
+        // Flatten all regions across groups for the edge-contour wireframe.
+        const allRegions = renderGroups.flatMap(g =>
+            g.type === 'plain'
+                ? g.regions
+                : [...g.maskRegions, ...g.contentRegions]
+        )
+
         _symbolObjs.set(uid, {
             id:           uid,
             name,
             label:        name.split('/').pop().replace(/^~/, ''),
-            meshes:       tessellateAll(regions),
-            edgeContours: extractEdgeContours(regions),
+            renderGroups: tessellateGroups(renderGroups),
+            edgeContours: extractEdgeContours(allRegions),
         })
     }
     return _symbolObjs.get(uid)
@@ -46,18 +55,17 @@ function _getSymbol(key, regions) {
 
 // ── Frame snapshot builder ────────────────────────────────────────────────
 
-// Parse and tessellate a single frame. Reuses cached symbol objects.
 function _buildSnapshot(symbolMap, rootName, frameNum) {
     const { symbolGeometry, rootNode } = parseHierarchy(rootName, symbolMap, frameNum)
 
     const symbols  = []
-    const symIdMap = new Map()   // "symbolName@@fn" → uid, for instance lookup
+    const symIdMap = new Map()   // "symbolName@@fn" → uid
 
-    for (const [key, regions] of symbolGeometry) {
-        const sym = _getSymbol(key, regions)
+    for (const [key, renderGroups] of symbolGeometry) {
+        const sym = _getSymbol(key, renderGroups)
         if (!symbols.some(s => s.id === sym.id)) {
             symbols.push(sym)
-            if (!sym.meshes?.length)
+            if (!sym.renderGroups?.length)
                 console.warn(`[fla] no geometry: ${key}`)
         }
         symIdMap.set(key, sym.id)
@@ -135,7 +143,6 @@ function _promptRoot(roots) {
         title.style.cssText = 'font-size:14px;font-weight:bold;margin-bottom:14px;color:#fff'
         box.appendChild(title)
 
-        // Tilde (composite) roots first, then alphabetical
         const sorted = [...roots].sort((a, b) => {
             const at = a.split('/').pop().startsWith('~') ? 0 : 1
             const bt = b.split('/').pop().startsWith('~') ? 0 : 1
@@ -207,7 +214,6 @@ async function importFla() {
     const rootName = roots.length > 1 ? await _promptRoot(roots) : roots[0]
     if (!rootName) return
 
-    // Release previous file's GPU data and caches
     viewport.clearSymbolVaos()
     _symbolIds.clear()
     _symbolObjs.clear()
@@ -228,7 +234,6 @@ async function importFla() {
     document.dispatchEvent(new CustomEvent('twist:flaImported', { detail: { frameCount } }))
 }
 
-// Scrub to a pre-cached frame. Does NOT reset the view.
 function scrubToFrame(frameNum) {
     _applyFrame(frameNum, false)
 }

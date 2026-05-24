@@ -11,7 +11,7 @@ import { evaluateInstance }       from '../scene/evaluate.js'
 
 const container = document.getElementById('viewport-container')
 const canvas    = document.getElementById('viewport-canvas')
-const gl        = canvas.getContext('webgl2')
+const gl        = canvas.getContext('webgl2', { stencil: true })
 
 if (!gl) throw new Error('WebGL2 not available.')
 
@@ -24,8 +24,8 @@ const ctx2d = overlay.getContext('2d')
 // ── Mat3 helpers (column-major Float32Array, matches GLSL mat3) ───────────
 
 const _IDENTITY_GL = new Float32Array([1,0,0, 0,1,0, 0,0,1])
+const _WHITE       = new Float32Array([1, 1, 1, 1])
 
-// Compose two column-major mat3s: result = A * B
 function composeMat3(A, B) {
     const R = new Float32Array(9)
     for (let c = 0; c < 3; c++)
@@ -34,7 +34,6 @@ function composeMat3(A, B) {
     return R
 }
 
-// Invert a 2D affine mat3 (column-major). Returns null if singular.
 function invertMat3(m) {
     const a = m[0], b = m[1], c = m[3], d = m[4], tx = m[6], ty = m[7]
     const det = a*d - b*c
@@ -46,14 +45,10 @@ function invertMat3(m) {
     ])
 }
 
-// Apply a column-major mat3 to a 2D point.
 function applyMat3(m, x, y) {
     return { x: m[0]*x + m[3]*y + m[6], y: m[1]*x + m[4]*y + m[7] }
 }
 
-// Build a column-major GL mat3 from an instance's current transform.
-// If rawMatrix is set and no keyframes exist, use it directly.
-// Otherwise compute from TRS (handles the test rectangle and keyframed instances).
 function instanceLocalMat(inst, frame, dragging, dragId) {
     if (inst.rawMatrix && !_hasKeyframes(inst)) {
         const [a,b,c,d,tx,ty] = inst.rawMatrix
@@ -69,7 +64,6 @@ function _hasKeyframes(inst) {
     return inst.tracks && Object.values(inst.tracks).some(tr => tr.length > 0)
 }
 
-// Walk up the parent chain and compose local matrices → world mat3.
 function getInstanceWorldMat(inst, frame) {
     const chain = []
     let cur = inst
@@ -95,15 +89,12 @@ function cssVarToGL(varName) {
 }
 
 // ── View transform ────────────────────────────────────────────────────────
-// view.x/y: pan offset in CSS pixels from canvas centre.
-// view.zoom: 1.0 = 1 world unit per CSS pixel.
-// Y convention: world Y+ is DOWN (matches screen/canvas coordinates).
 
 const view     = { x: 0, y: 0, zoom: 1.0 }
 const MIN_ZOOM = 0.01
 const MAX_ZOOM = 64.0
 
-let cssW = 0   // canvas size in CSS pixels, updated by _resize()
+let cssW = 0
 let cssH = 0
 
 function worldToScreen(wx, wy) {
@@ -120,8 +111,6 @@ function screenToWorld(sx, sy) {
     }
 }
 
-// World → NDC matrix for the vertex shader. Column-major Float32Array.
-// NDC Y is flipped (up = +1) vs screen Y (up = smaller value), hence -sy.
 function worldToClipMatrix() {
     const sx = 2 * view.zoom / cssW
     const sy = 2 * view.zoom / cssH
@@ -148,7 +137,6 @@ function fitCamera() {
 
 // ── Instance transform helpers ────────────────────────────────────────────
 
-// TRS matrix: local space → world space. Column-major Float32Array for GLSL.
 function instanceToModelMatrix(t) {
     const cos = Math.cos(t.rotation)
     const sin = Math.sin(t.rotation)
@@ -159,7 +147,6 @@ function instanceToModelMatrix(t) {
     ])
 }
 
-// Transform a local-space point into world space.
 function localToWorld(lx, ly, t) {
     const cos = Math.cos(t.rotation)
     const sin = Math.sin(t.rotation)
@@ -169,7 +156,6 @@ function localToWorld(lx, ly, t) {
     }
 }
 
-// Transform a world-space point into an instance's local space (inverse TRS).
 function worldToLocal(wx, wy, t) {
     const cos = Math.cos(t.rotation)
     const sin = Math.sin(t.rotation)
@@ -182,7 +168,7 @@ function worldToLocal(wx, wy, t) {
 }
 
 // AABB of a symbol's vertices in its own local space.
-// Handles FLA {meshes}, legacy {submeshes}, and bare {vertices}.
+// Handles renderGroups (new), meshes (legacy flat), submeshes, and bare vertices.
 function getSymbolLocalAABB(symbol) {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
 
@@ -194,7 +180,14 @@ function getSymbolLocalAABB(symbol) {
         }
     }
 
-    if (symbol.meshes) {
+    if (symbol.renderGroups) {
+        for (const g of symbol.renderGroups) {
+            const all = g.type === 'plain'
+                ? g.meshes
+                : [...g.maskMeshes, ...g.contentMeshes]
+            for (const m of all) scan(m.vertices)
+        }
+    } else if (symbol.meshes) {
         for (const m of symbol.meshes)    scan(m.vertices)
     } else if (symbol.submeshes) {
         for (const sm of symbol.submeshes) scan(sm.vertices)
@@ -205,11 +198,8 @@ function getSymbolLocalAABB(symbol) {
     return { minX, minY, maxX, maxY }
 }
 
-// Point-in-AABB test using the instance's full world matrix.
-// Only tests instances without a parent (top-level); body-part selection
-// goes through the outliner.
 function hitTestInstance(wx, wy, instance) {
-    if (instance.parentId) return false    // only top-level instances are viewport-selectable
+    if (instance.parentId) return false
     const sym = scene.symbols.find(s => s.id === instance.symbolId)
     if (!sym) return false
     const aabb = getSymbolLocalAABB(sym)
@@ -223,25 +213,21 @@ function hitTestInstance(wx, wy, instance) {
 }
 
 // ── Selection state ───────────────────────────────────────────────────────
-// Not journaled — selection is editor state, not scene data.
 
 let selectedId = null
 
 // ── External tool state ───────────────────────────────────────────────────
-// Set by modal tools (transform-tool, etc.) to suppress built-in drag.
 
 let _externalToolActive = false
 
-// Overlay hooks — any module can push a fn(ctx2d, cssW, cssH) to draw
-// on top of the viewport's own overlay. Called after the built-in overlay.
 const _overlayHooks = []
 
 // ── Drag state ────────────────────────────────────────────────────────────
 
 let isDragging        = false
 let dragInstanceId    = null
-let dragStartWorld    = null    // world pos when drag began
-let dragOldTransform  = null    // snapshot of transform before drag
+let dragStartWorld    = null
+let dragOldTransform  = null
 let dragStartClientX  = 0
 let dragStartClientY  = 0
 
@@ -278,10 +264,10 @@ function _stopPan(e) {
     canvas.style.cursor = ''
 }
 
-// ── Tool state (select / drag) ────────────────────────────────────────────
+// ── Tool state ────────────────────────────────────────────────────────────
 
 function _startTool(e) {
-    if (_externalToolActive) return    // modal tool has control
+    if (_externalToolActive) return
     const rect = canvas.getBoundingClientRect()
     const wx   = (e.clientX - rect.left - cssW / 2 - view.x) / view.zoom
     const wy   = (e.clientY - rect.top  - cssH / 2 - view.y) / view.zoom
@@ -289,7 +275,6 @@ function _startTool(e) {
     dragStartClientX = e.clientX
     dragStartClientY = e.clientY
 
-    // Reverse order = topmost instance first
     const hit = [...scene.instances].reverse().find(i => hitTestInstance(wx, wy, i))
 
     if (hit) {
@@ -377,14 +362,20 @@ canvas.addEventListener('wheel', e => {
     viewport.markDirty()
 }, { passive: false })
 
-// ── GL state (populated by init) ──────────────────────────────────────────
+// ── GL state ──────────────────────────────────────────────────────────────
 
 let _prog        = null
 let _uniforms    = null
-const _symbolVaos = new Map()   // symbol.id → { vao, vertexCount }
-const _edgeVaos   = new Map()   // symbol.id → [{ vao, count, color }]
 
-let _showEdges = false   // E key toggles
+// _symbolVaos: symId → array of render groups
+//   plain group:  { type:'plain',  vaos: [vaoEntry, ...] }
+//   masked group: { type:'masked', maskVaos:[{vao,vertexCount},...], contentVaos:[vaoEntry,...] }
+//
+// vaoEntry: { fillType, color?, stopCount?, stopOffsets?, stopColors?, gradientMatInv?, vao, vertexCount }
+const _symbolVaos = new Map()
+const _edgeVaos   = new Map()
+
+let _showEdges = false
 
 window.addEventListener('keydown', e => {
     if (e.code === 'KeyE' && !e.repeat) {
@@ -420,7 +411,6 @@ const viewport = {
     setToolActive(v)  { _externalToolActive = v },
     addOverlayHook(fn){ _overlayHooks.push(fn) },
 
-    // World-space origin (registration point) of an instance.
     getWorldOrigin(instId) {
         const inst = scene.instances.find(i => i.id === instId)
         if (!inst) return null
@@ -428,8 +418,6 @@ const viewport = {
         return { x: m[6], y: m[7] }
     },
 
-    // Transform a world-space delta (direction, not position) into the local
-    // space of parentInstId. Used by the transform tool for child instances.
     worldDeltaToLocal(parentInstId, wdx, wdy) {
         const parent = scene.instances.find(i => i.id === parentInstId)
         if (!parent) return { x: wdx, y: wdy }
@@ -447,18 +435,21 @@ const viewport = {
 
     markDirty() { this.dirty = true },
 
-    // Free all symbol VAOs and clear the caches. Call before a full scene reload.
     clearSymbolVaos() {
-        for (const meshes of _symbolVaos.values())
-            for (const { vao } of meshes) gl.deleteVertexArray(vao)
+        for (const groups of _symbolVaos.values()) {
+            for (const group of groups) {
+                const entries = group.type === 'plain'
+                    ? group.vaos
+                    : [...group.maskVaos, ...group.contentVaos]
+                for (const e of entries) gl.deleteVertexArray(e.vao)
+            }
+        }
         for (const contours of _edgeVaos.values())
             for (const { vao } of contours) gl.deleteVertexArray(vao)
         _symbolVaos.clear()
         _edgeVaos.clear()
     },
 
-    // Build GL VAO(s) for a symbol by id. Safe to call after init() for new symbols.
-    // No-op if the symbol's VAOs are already uploaded — safe to call on every frame apply.
     buildSymbolVaos(symId) {
         if (_symbolVaos.has(symId)) return
         const sym = scene.symbols.find(s => s.id === symId)
@@ -476,18 +467,50 @@ const viewport = {
             return { vao, vertexCount: vertices.length / 2 }
         }
 
-        if (sym.meshes?.length) {
-            // Ordered fill+stroke meshes — one VAO per entry, drawn in array order
-            _symbolVaos.set(sym.id, sym.meshes.map(m => ({
-                color: new Float32Array(m.color),
-                ...makeVao(m.vertices),
-            })))
-        } else if (sym.vertices) {
-            // Legacy single-mesh symbol
-            _symbolVaos.set(sym.id, [{ color: new Float32Array(sym.color ?? [0,0,0,1]), ...makeVao(sym.vertices) }])
+        function meshToEntry(mesh) {
+            const base = makeVao(mesh.vertices)
+            if (mesh.fillType === 0) {
+                return { fillType: 0, color: new Float32Array(mesh.color), ...base }
+            }
+            return {
+                fillType:       mesh.fillType,
+                gradientMatInv: mesh.gradientMatInv,
+                stopCount:      mesh.stopCount,
+                stopOffsets:    mesh.stopOffsets,
+                stopColors:     mesh.stopColors,
+                ...base,
+            }
         }
 
-        // Edge overlay: one VAO per stitched contour (LINE_LOOP)
+        if (sym.renderGroups?.length) {
+            _symbolVaos.set(sym.id, sym.renderGroups.map(g => {
+                if (g.type === 'plain') {
+                    return { type: 'plain', vaos: g.meshes.map(meshToEntry) }
+                }
+                return {
+                    type:        'masked',
+                    maskVaos:    g.maskMeshes.map(m => makeVao(m.vertices)),
+                    contentVaos: g.contentMeshes.map(meshToEntry),
+                }
+            }))
+        } else if (sym.meshes?.length) {
+            // Legacy flat mesh array — wrap in a single plain group
+            _symbolVaos.set(sym.id, [{
+                type: 'plain',
+                vaos: sym.meshes.map(m => ({
+                    fillType: 0,
+                    color:    new Float32Array(m.color),
+                    ...makeVao(m.vertices),
+                }))
+            }])
+        } else if (sym.vertices) {
+            // Legacy bare single-mesh symbol (test scene)
+            _symbolVaos.set(sym.id, [{
+                type: 'plain',
+                vaos: [{ fillType: 0, color: new Float32Array(sym.color ?? [0,0,0,1]), ...makeVao(sym.vertices) }]
+            }])
+        }
+
         if (sym.edgeContours?.length) {
             _edgeVaos.set(sym.id, sym.edgeContours.map(({ color, vertices }) => ({
                 color: new Float32Array(color),
@@ -511,7 +534,6 @@ const viewport = {
         this.dirty = true
     },
 
-    // Advance playback by the elapsed time since the last RAF tick.
     _advance(timestamp) {
         const delta = this._lastTimestamp > 0 ? timestamp - this._lastTimestamp : 0
         this._lastTimestamp = timestamp
@@ -537,7 +559,6 @@ const viewport = {
         gl.enable(gl.BLEND)
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
-        // Build children map sorted by order (ascending = back-to-front).
         const childrenOf = new Map()
         for (const inst of scene.instances) {
             const pid = inst.parentId ?? null
@@ -549,20 +570,67 @@ const viewport = {
 
         const frame = scene.timeline.currentFrame
 
-        // DFS traversal: accumulate world matrix, draw each symbol's geometry,
-        // then recurse into children. This gives correct painter's-algorithm order.
+        // Draw a single mesh entry — handles solid and gradient fills.
+        const drawEntry = (entry, worldMat) => {
+            gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+            if (entry.fillType === 0) {
+                gl.uniform1i(_uniforms.fillType, 0)
+                gl.uniform4fv(_uniforms.color, entry.color)
+            } else {
+                gl.uniform1i(_uniforms.fillType, entry.fillType)
+                gl.uniformMatrix3fv(_uniforms.gradMatInv, false, entry.gradientMatInv)
+                gl.uniform1i(_uniforms.stopCount, entry.stopCount)
+                gl.uniform1fv(_uniforms.stopOffsets, entry.stopOffsets)
+                gl.uniform4fv(_uniforms.stopColors, entry.stopColors)
+            }
+            gl.bindVertexArray(entry.vao)
+            gl.drawArrays(gl.TRIANGLES, 0, entry.vertexCount)
+        }
+
+        // Draw a masked group using the WebGL stencil buffer.
+        // Mask geometry is written to stencil (no colour output), then content
+        // is rendered only where stencil == 1. Stencil is cleared after each group
+        // so masks from different instances don't interfere.
+        const drawMaskedGroup = (group, worldMat) => {
+            gl.enable(gl.STENCIL_TEST)
+
+            // Pass 1: write mask shape into stencil, suppress colour output.
+            gl.stencilFunc(gl.ALWAYS, 1, 0xFF)
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE)
+            gl.colorMask(false, false, false, false)
+            gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+            gl.uniform1i(_uniforms.fillType, 0)
+            gl.uniform4fv(_uniforms.color, _WHITE)
+            for (const mv of group.maskVaos) {
+                gl.bindVertexArray(mv.vao)
+                gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
+            }
+            gl.colorMask(true, true, true, true)
+
+            // Pass 2: draw content clipped to stencil.
+            gl.stencilFunc(gl.EQUAL, 1, 0xFF)
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP)
+            for (const cv of group.contentVaos) drawEntry(cv, worldMat)
+
+            // Restore stencil state for subsequent draws.
+            gl.stencilMask(0xFF)
+            gl.clear(gl.STENCIL_BUFFER_BIT)
+            gl.disable(gl.STENCIL_TEST)
+        }
+
         const drawSubtree = (parentId, parentWorldMat) => {
             for (const inst of (childrenOf.get(parentId) ?? [])) {
                 const localMat = instanceLocalMat(inst, frame, isDragging, dragInstanceId)
                 const worldMat = composeMat3(parentWorldMat, localMat)
-                const mesh     = _symbolVaos.get(inst.symbolId)
+                const groups   = _symbolVaos.get(inst.symbolId)
 
-                if (mesh?.length) {
-                    gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
-                    for (const { vao, vertexCount, color } of mesh) {
-                        gl.uniform4fv(_uniforms.color, color)
-                        gl.bindVertexArray(vao)
-                        gl.drawArrays(gl.TRIANGLES, 0, vertexCount)
+                if (groups?.length) {
+                    for (const group of groups) {
+                        if (group.type === 'plain') {
+                            for (const entry of group.vaos) drawEntry(entry, worldMat)
+                        } else {
+                            drawMaskedGroup(group, worldMat)
+                        }
                     }
                 }
 
@@ -574,8 +642,8 @@ const viewport = {
 
         // ── Edge overlay pass ────────────────────────────────────────────
         if (_showEdges) {
-            const SEL_COLOR = new Float32Array([1.0, 0.85, 0.1, 1.0])   // yellow highlight
-            const _dimColor = new Float32Array(4)                        // reused scratch
+            const SEL_COLOR = new Float32Array([1.0, 0.85, 0.1, 1.0])
+            const _dimColor = new Float32Array(4)
 
             const drawEdgeSubtree = (parentId, parentWorldMat) => {
                 for (const inst of (childrenOf.get(parentId) ?? [])) {
@@ -586,6 +654,7 @@ const viewport = {
 
                     if (contours?.length) {
                         gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+                        gl.uniform1i(_uniforms.fillType, 0)
                         for (const { vao, vertexCount, color } of contours) {
                             let drawColor
                             if (isSelected) {
@@ -611,25 +680,18 @@ const viewport = {
         gl.bindVertexArray(null)
     },
 
-    // Ring mesh: outer quad (-1…1 NDC) with a rectangular hole cut out for the
-    // camera frame. 8 verts × 4 bands × 2 tris = 8 tris, 24 verts, zero seams.
     _renderPassepartout() {
         if (!_passeProg) return
         const cam = scene.camera
         const tl  = worldToScreen(cam.x - cam.width  / 2, cam.y - cam.height / 2)
         const br  = worldToScreen(cam.x + cam.width  / 2, cam.y + cam.height / 2)
-        // Screen-px → NDC.  NDC Y is flipped vs screen Y.
         const nx0 = (tl.x / cssW) * 2 - 1,  ny0 = 1 - (tl.y / cssH) * 2
         const nx1 = (br.x / cssW) * 2 - 1,  ny1 = 1 - (br.y / cssH) * 2
         // prettier-ignore
         const v = new Float32Array([
-            // top band
             -1,  1,   1,  1,  nx1,ny0,   -1,  1,  nx1,ny0,  nx0,ny0,
-            // right band
              1,  1,   1, -1,  nx1,ny1,    1,  1,  nx1,ny1,  nx1,ny0,
-            // bottom band
              1, -1,  -1, -1,  nx0,ny1,    1, -1,  nx0,ny1,  nx1,ny1,
-            // left band
             -1, -1,  -1,  1,  nx0,ny0,   -1, -1,  nx0,ny0,  nx0,ny1,
         ])
         gl.useProgram(_passeProg)
@@ -649,15 +711,13 @@ const viewport = {
         ctx2d.scale(dpr, dpr)
         ctx2d.clearRect(0, 0, cssW, cssH)
 
-        // ── Passepartout border stroke ───────────────────────────────────
         const tl = worldToScreen(cam.x - cam.width  / 2, cam.y - cam.height / 2)
         const br = worldToScreen(cam.x + cam.width  / 2, cam.y + cam.height / 2)
         const fw = br.x - tl.x,  fh = br.y - tl.y
-        ctx2d.strokeStyle = 'rgba(0, 0, 0, 0.73)'
+        ctx2d.strokeStyle = 'rgba(255,255,255,0.18)'
         ctx2d.lineWidth   = 1
         ctx2d.strokeRect(Math.round(tl.x) + 0.5, Math.round(tl.y) + 0.5, Math.round(fw), Math.round(fh))
 
-        // ── Selection box ───────────────────────────────────────────────
         if (selectedId !== null) {
             const inst = scene.instances.find(i => i.id === selectedId)
             const sym  = inst && scene.symbols.find(s => s.id === inst.symbolId)
@@ -693,7 +753,8 @@ const viewport = {
         gl.viewport(0, 0, canvas.width, canvas.height)
         const [r, g, b] = cssVarToGL('--bg-base')
         gl.clearColor(r, g, b, 1.0)
-        gl.clear(gl.COLOR_BUFFER_BIT)
+        gl.clearStencil(0)
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT)
     },
 
     _renderCheckerboard() {
@@ -719,12 +780,16 @@ const viewport = {
     },
 
     init() {
-        // Compile shader program
         _prog     = createProgram(gl, VERT_SCENE, FRAG_SCENE)
         _uniforms = {
             viewMatrix:  gl.getUniformLocation(_prog, 'uViewMatrix'),
             modelMatrix: gl.getUniformLocation(_prog, 'uModelMatrix'),
             color:       gl.getUniformLocation(_prog, 'uColor'),
+            fillType:    gl.getUniformLocation(_prog, 'uFillType'),
+            gradMatInv:  gl.getUniformLocation(_prog, 'uGradMatInv'),
+            stopCount:   gl.getUniformLocation(_prog, 'uStopCount'),
+            stopOffsets: gl.getUniformLocation(_prog, 'uStopOffsets'),
+            stopColors:  gl.getUniformLocation(_prog, 'uStopColors'),
         }
 
         // Passepartout ring — dynamic VBO, 24 verts × 2 floats = 48 floats
@@ -770,7 +835,6 @@ const viewport = {
             'font:11px/1 var(--font-mono,monospace)', 'color:rgba(255,255,255,0.65)',
         ].join(';')
 
-        // Extras button + dropdown
         const extrasBtn = document.createElement('button')
         extrasBtn.textContent = 'Extras ▾'
         extrasBtn.style.cssText = [
@@ -829,7 +893,6 @@ const viewport = {
             checker.opacity = parseFloat(e.target.value); this.markDirty()
         })
 
-        // Build VAOs for all symbols in the initial scene
         for (const sym of scene.symbols) this.buildSymbolVaos(sym.id)
 
         const observer = new ResizeObserver(() => { this._resize(); this.markDirty() })

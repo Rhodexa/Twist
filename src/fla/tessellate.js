@@ -6,6 +6,7 @@ import earcut from '../../node_modules/earcut/src/earcut.js'
 
 const BEZIER_STEPS = 8   // segments per quadratic bezier curve
 const STITCH_EPS   = 0.05 // px — endpoint matching tolerance
+const MAX_STOPS    = 16   // Flash gradient stop limit
 
 // ── Bezier subdivision ─────────────────────────────────────────────────────
 
@@ -120,7 +121,6 @@ function stitchContours(segs) {
 // ── Earcut tessellation ────────────────────────────────────────────────────
 
 // Shoelace signed area. Positive = CW in screen space (Y-down) = outer.
-// Negative = CCW in screen space = hole. Earcut fixes winding internally.
 function signedArea(pts) {
     let a = 0
     const n = pts.length / 2
@@ -147,7 +147,6 @@ function pointInPolygon(px, py, pts) {
 function tessellateContours(contours) {
     if (!contours.length) return null
 
-    // Single contour: trivial path, no nesting needed.
     if (contours.length === 1) {
         if (contours[0].length < 6) return null
         const idx = earcut(contours[0], null, 2)
@@ -161,7 +160,6 @@ function tessellateContours(contours) {
     }
 
     // Multiple contours: group into (outer + holes) clusters, then earcut each.
-    // Sort by absolute area descending so the largest contour is processed first.
     const byArea = contours
         .filter(c => c.length >= 6)
         .map(pts => ({ pts, absArea: Math.abs(signedArea(pts)) }))
@@ -175,7 +173,6 @@ function tessellateContours(contours) {
         used[i] = true
         const outerPts = byArea[i].pts
 
-        // Any unused contour whose first vertex is inside this outer → hole.
         const holes = []
         for (let j = i + 1; j < byArea.length; j++) {
             if (used[j]) continue
@@ -185,7 +182,6 @@ function tessellateContours(contours) {
             }
         }
 
-        // Concatenate outer + holes for earcut, recording hole start indices.
         const verts      = [...outerPts]
         const holeStarts = []
         for (const h of holes) {
@@ -200,11 +196,43 @@ function tessellateContours(contours) {
     return allTris.length ? new Float32Array(allTris) : null
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
+// ── Gradient helpers ───────────────────────────────────────────────────────
 
-// Tessellate an ordered regions array into GPU meshes, preserving paint order.
-// Input:  [{ type:'fill'|'stroke', color, segs, width? }]
-// Output: [{ color: Float32Array, vertices: Float32Array }]  (same order)
+// Invert a 2D affine matrix [a,b,c,d,tx,ty]. Returns null if singular.
+function invertMat6([a, b, c, d, tx, ty]) {
+    const det = a*d - b*c
+    if (Math.abs(det) < 1e-10) return null
+    return [
+         d / det,              -b / det,
+        -c / det,               a / det,
+        (c*ty - d*tx) / det,  (b*tx - a*ty) / det,
+    ]
+}
+
+// Convert [a,b,c,d,tx,ty] to a column-major GL mat3 Float32Array.
+function mat6ToGLMat3([a, b, c, d, tx, ty]) {
+    return new Float32Array([a, b, 0,  c, d, 0,  tx, ty, 1])
+}
+
+// Pack gradient stops into pre-sized GPU arrays (MAX_STOPS slots).
+function packGradientStops(stops) {
+    const count      = Math.min(stops.length, MAX_STOPS)
+    const offsets    = new Float32Array(MAX_STOPS)
+    const colors     = new Float32Array(MAX_STOPS * 4)
+    for (let i = 0; i < count; i++) {
+        offsets[i]    = stops[i].offset
+        colors[i*4]   = stops[i].color[0]
+        colors[i*4+1] = stops[i].color[1]
+        colors[i*4+2] = stops[i].color[2]
+        colors[i*4+3] = stops[i].color[3]
+    }
+    return { count, offsets, colors }
+}
+
+// ── Tessellate regions ─────────────────────────────────────────────────────
+
+// Input:  [{ type:'fill'|'stroke', fill?:{type,color?,stops?,matrix?}, color?, segs, width? }]
+// Output: [{ fillType, color?, stopCount?, stopOffsets?, stopColors?, gradientMatInv?, vertices }]
 function tessellateAll(regions) {
     const meshes = []
     for (const r of regions) {
@@ -215,50 +243,74 @@ function tessellateAll(regions) {
         } else {
             verts = tessellateStroke(r.segs, r.width)
         }
-        if (verts && verts.length >= 6) meshes.push({ color: r.color, vertices: verts })
+        if (!verts || verts.length < 6) continue
+
+        if (r.type === 'stroke') {
+            meshes.push({ fillType: 0, color: r.color, vertices: verts })
+        } else if (r.fill?.type === 'solid') {
+            meshes.push({ fillType: 0, color: r.fill.color, vertices: verts })
+        } else if (r.fill?.type === 'linear' || r.fill?.type === 'radial') {
+            const fillType   = r.fill.type === 'linear' ? 1 : 2
+            const invMat6    = invertMat6(r.fill.matrix)
+            const glMat      = invMat6 ? mat6ToGLMat3(invMat6) : mat6ToGLMat3([1,0,0,1,0,0])
+            const { count, offsets, colors } = packGradientStops(r.fill.stops)
+            meshes.push({
+                fillType,
+                gradientMatInv: glMat,
+                stopCount:      count,
+                stopOffsets:    offsets,
+                stopColors:     colors,
+                vertices:       verts,
+            })
+        }
     }
     return meshes
 }
 
+// Tessellate an array of render groups (as produced by collectDirectRegions).
+// Input:  [{ type:'plain'|'masked', regions?, maskRegions?, contentRegions? }]
+// Output: [{ type:'plain', meshes } | { type:'masked', maskMeshes, contentMeshes }]
+function tessellateGroups(groups) {
+    const result = []
+    for (const g of groups) {
+        if (g.type === 'plain') {
+            const meshes = tessellateAll(g.regions)
+            if (meshes.length) result.push({ type: 'plain', meshes })
+        } else {
+            const maskMeshes    = tessellateAll(g.maskRegions)
+            const contentMeshes = tessellateAll(g.contentRegions)
+            if (maskMeshes.length || contentMeshes.length)
+                result.push({ type: 'masked', maskMeshes, contentMeshes })
+        }
+    }
+    return result
+}
+
 // Edge overlay: LINE_LOOP contours from fill regions only (debug wireframe).
-// Input:  [{ type, color, segs, ... }]
+// Input:  flat regions array [{ type, fill?, color?, segs, ... }]
 // Output: [{ color: [r,g,b,a], vertices: Float32Array }]
 function extractEdgeContours(regions) {
     const result = []
     for (const r of regions) {
         if (r.type !== 'fill') continue
+        // Use solid fill colour; for gradients use the first stop as a stand-in.
+        const color = r.fill?.type === 'solid'
+            ? r.fill.color
+            : (r.fill?.stops?.[0]?.color ?? [0.5, 0.5, 0.5, 1.0])
         const contours = stitchContours(r.segs)
         for (const pts of contours) {
-            if (pts.length >= 4) result.push({ color: r.color, vertices: new Float32Array(pts) })
+            if (pts.length >= 4) result.push({ color, vertices: new Float32Array(pts) })
         }
     }
     return result
 }
 
 // ── Stroke tessellation ───────────────────────────────────────────────────
-// Expands a flat [x,y,...] polyline into triangle vertices using per-vertex
-// miter normals for smooth, gap-free joins, plus round caps on open ends.
-//
-// At each interior vertex the offset direction is the bisector of the two
-// adjacent edge normals, scaled by 1/cos(θ/2) so the stroke width is
-// preserved perpendicular to each edge.  The scale is clamped to MITER_LIMIT
-// to prevent runaway spikes at near-180° kinks.
-//
-// Round caps: at each open endpoint a semicircular fan sweeps the left-normal
-// 180° through the backward (start) or forward (end) tangent to the right-
-// normal.  CAP_STEPS controls smoothness; 8 is visually indistinguishable
-// from a true circle at typical cartoon stroke widths.
-//
-// closed=true wraps end→start so a closed stroke outline has no cap or seam.
+// (unchanged from previous implementation)
 
 const MITER_LIMIT = 4.0
 const CAP_STEPS   = 8
 
-// Append a semicircular cap fan into tris.
-// (cx,cy)      — endpoint centre
-// (nx,ny)      — left-facing edge normal at this endpoint (unit)
-// (capDx,capDy)— direction the cap bulges outward (unit, ⊥ to normal)
-// Sweeps from +normal → capDir → -normal in CAP_STEPS triangles.
 function addRoundCap(tris, cx, cy, nx, ny, capDx, capDy, halfWidth) {
     for (let k = 0; k < CAP_STEPS; k++) {
         const a0 = Math.PI *  k      / CAP_STEPS
@@ -279,7 +331,6 @@ function expandPolyline(pts, halfWidth, closed = false) {
 
     const edgeCount = closed ? n : n - 1
 
-    // Per-edge left-facing unit normals.
     const enx = new Float32Array(edgeCount)
     const eny = new Float32Array(edgeCount)
     for (let i = 0; i < edgeCount; i++) {
@@ -290,14 +341,12 @@ function expandPolyline(pts, halfWidth, closed = false) {
         if (len > 1e-6) { enx[i] = -dy / len; eny[i] = dx / len }
     }
 
-    // Per-vertex miter offset (left and right world-space points).
     const vlx = new Float32Array(n), vly = new Float32Array(n)
     const vrx = new Float32Array(n), vry = new Float32Array(n)
 
     for (let i = 0; i < n; i++) {
         const px = pts[i*2], py = pts[i*2+1]
 
-        // Which edges are adjacent?
         let n1x, n1y, n2x, n2y
         if (closed) {
             const pe = (i - 1 + edgeCount) % edgeCount
@@ -313,13 +362,11 @@ function expandPolyline(pts, halfWidth, closed = false) {
             n2x = enx[i];   n2y = eny[i]
         }
 
-        // Bisector of the two normals.
         let mx = n1x + n2x, my = n1y + n2y
         const mlen = Math.sqrt(mx*mx + my*my)
 
         let scale
         if (mlen < 1e-6) {
-            // ~180° reversal — use outgoing normal, no amplification needed.
             mx = n2x; my = n2y; scale = halfWidth
         } else {
             mx /= mlen; my /= mlen
@@ -335,26 +382,16 @@ function expandPolyline(pts, halfWidth, closed = false) {
 
     const tris = []
 
-    // Round caps on open polylines.
-    // Tangent from normal: tangent = (eny, -enx), so backward = (-eny, enx).
     if (!closed) {
-        // Start cap — cap bulges backward (opposite the first edge tangent).
-        addRoundCap(tris,
-            pts[0], pts[1],
-            enx[0], eny[0],
-            -eny[0], enx[0],   // backward tangent
-            halfWidth)
-
-        // End cap — cap bulges forward (along the last edge tangent).
+        addRoundCap(tris, pts[0], pts[1], enx[0], eny[0], -eny[0], enx[0], halfWidth)
         const e = edgeCount - 1
         addRoundCap(tris,
             pts[(n-1)*2], pts[(n-1)*2+1],
             enx[e], eny[e],
-            eny[e], -enx[e],   // forward tangent
+            eny[e], -enx[e],
             halfWidth)
     }
 
-    // Build two triangles per edge.
     for (let i = 0; i < edgeCount; i++) {
         const j = (i + 1) % n
         tris.push(
@@ -365,8 +402,6 @@ function expandPolyline(pts, halfWidth, closed = false) {
     return tris
 }
 
-// Returns true when the first and last points of a polyline are the same
-// vertex (within tolerance), meaning the contour closes on itself.
 function isClosedPolyline(pts) {
     const n = pts.length / 2
     if (n < 3) return false
@@ -375,7 +410,6 @@ function isClosedPolyline(pts) {
     return dx*dx + dy*dy <= STITCH_EPS * STITCH_EPS * 4
 }
 
-// Tessellate stroke segments into triangle meshes with proper miter joins.
 function tessellateStroke(segs, widthPx) {
     const hw = widthPx / 2
     const chains = stitchContours(segs)
@@ -387,15 +421,4 @@ function tessellateStroke(segs, widthPx) {
     return tris.length ? new Float32Array(tris) : null
 }
 
-// Input:  [{ color: [r,g,b,a], width: px, segs: Seg[] }]
-// Output: [{ color: [r,g,b,a], vertices: Float32Array }]
-function tessellateStrokes(strokeRegions) {
-    const result = []
-    for (const { color, width, segs } of strokeRegions) {
-        const verts = tessellateStroke(segs, width)
-        if (verts && verts.length >= 6) result.push({ color, vertices: verts })
-    }
-    return result
-}
-
-export { tessellateAll, extractEdgeContours }
+export { tessellateAll, tessellateGroups, extractEdgeContours }

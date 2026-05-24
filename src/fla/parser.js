@@ -10,8 +10,6 @@ function parseXml(str) {
 }
 
 // ── Direct-child helpers ───────────────────────────────────────────────────
-// getElementsByTagNameNS is recursive; for structure navigation we want
-// direct children only.
 
 function childByLocalName(elem, name) {
     for (const c of elem.children) if (c.localName === name) return c
@@ -71,11 +69,10 @@ function decodeHex(tok) {
     const ih = dot < 0 ? s : s.slice(0, dot)
     const fh = dot < 0 ? '0' : s.slice(dot + 1)
     let v = parseInt(ih, 16)
-    if (v >= 0x800000) v -= 0x1000000   // 24-bit two's complement
+    if (v >= 0x800000) v -= 0x1000000
     return v + parseInt(fh, 16) / 256.0
 }
 
-// Matches Flash edge string tokens: commands, Sn selectors, #hex, decimals.
 const TOK_RE = /[!|[]|S\d+|#[0-9A-Fa-f]+(?:\.[0-9A-Fa-f]+)?|[-+]?\d+(?:\.\d+)?/g
 
 function parseEdgeStr(s) {
@@ -86,7 +83,7 @@ function parseEdgeStr(s) {
     function num() {
         const tok = tokens[i++]
         const raw = tok.startsWith('#') ? decodeHex(tok) : parseFloat(tok)
-        return raw / 20.0   // twips → pixels
+        return raw / 20.0
     }
 
     while (i < tokens.length) {
@@ -97,7 +94,6 @@ function parseEdgeStr(s) {
             const cx = num(), cy = num(), x = num(), y = num()
             cmds.push({ type: 'Q', cx, cy, x, y })
         }
-        // 'S' style tokens: already consumed by regex, drop them
     }
     return cmds
 }
@@ -115,8 +111,6 @@ function splitSegs(cmds) {
     return segs
 }
 
-// Reverse a segment so fill-right (fillStyle1) becomes fill-left.
-// Control point is kept in place (known approximation — correct later per REFACTOR).
 function reverseSeg(seg) {
     if (seg.length < 2) return seg
     const steps = []
@@ -136,7 +130,6 @@ function reverseSeg(seg) {
     return result
 }
 
-// Apply matrix to every coordinate in a segment.
 function applyMatToSeg(mat, seg) {
     if (isIdentity(mat)) return seg
     return seg.map(c => {
@@ -151,7 +144,11 @@ function applyMatToSeg(mat, seg) {
     })
 }
 
-// ── Fill color ─────────────────────────────────────────────────────────────
+// ── Fill style ─────────────────────────────────────────────────────────────
+// Returns a fill descriptor:
+//   { type: 'solid', color: [r,g,b,a] }
+//   { type: 'linear'|'radial', stops: [{offset, color}], matrix: [a,b,c,d,tx,ty] }
+// The matrix maps gradient space → shape local space (same convention as Flash / FLA-RE).
 
 function hexColorToRgba(hex, alpha) {
     const r = parseInt(hex.slice(1, 3), 16) / 255
@@ -160,20 +157,34 @@ function hexColorToRgba(hex, alpha) {
     return [r, g, b, alpha]
 }
 
-function getFillColor(shapeElem, idx) {
+function getFill(shapeElem, idx) {
     for (const fs of shapeElem.getElementsByTagNameNS(XFL_NS, 'FillStyle')) {
         if (fs.getAttribute('index') !== String(idx)) continue
+
         const sc = childByLocalName(fs, 'SolidColor')
         if (sc) {
             const color = sc.getAttribute('color') ?? '#000000'
             const alpha = parseFloat(sc.getAttribute('alpha') ?? '1')
-            return hexColorToRgba(color, alpha)
+            return { type: 'solid', color: hexColorToRgba(color, alpha) }
         }
-        // Gradient — placeholder color for now
-        if (childByLocalName(fs, 'LinearGradient')) return [0.53, 0.67, 1.0, 1.0]
-        if (childByLocalName(fs, 'RadialGradient')) return [1.0, 0.67, 0.53, 1.0]
+
+        for (const [tag, fillType] of [['LinearGradient', 'linear'], ['RadialGradient', 'radial']]) {
+            const grad = childByLocalName(fs, tag)
+            if (!grad) continue
+
+            const matrix = readMatrix(grad)   // gradient space → shape local (pixels)
+            const stops  = []
+            for (const entry of childrenByLocalName(grad, 'GradientEntry')) {
+                const offset = parseFloat(entry.getAttribute('ratio') ?? '0')  // 0.0 – 1.0
+                const color  = entry.getAttribute('color') ?? '#000000'
+                const alpha  = parseFloat(entry.getAttribute('alpha') ?? '1')
+                stops.push({ offset, color: hexColorToRgba(color, alpha) })
+            }
+
+            return { type: fillType, stops, matrix }
+        }
     }
-    return [0, 0, 0, 1]
+    return { type: 'solid', color: [0, 0, 0, 1] }
 }
 
 // ── Stroke style ───────────────────────────────────────────────────────────
@@ -199,9 +210,9 @@ function getStrokeStyle(shapeElem, idx) {
 }
 
 // ── Shape → fill + stroke region segments ──────────────────────────────────
+// Fills:   Map<fillIdx, { fill, segs }>   — fill descriptor + segments in worldMat space
+// Strokes: Map<strokeIdx, { color, width, segs }>
 
-// Fills: Map<fillIdx, {color, segs}>  (segments in worldMat space)
-// Strokes: Map<strokeIdx, {color, width, segs}>
 function shapeToRegions(shapeElem, worldMat, fillMap, strokeMap) {
     if (!fillMap)   fillMap   = new Map()
     if (!strokeMap) strokeMap = new Map()
@@ -220,12 +231,26 @@ function shapeToRegions(shapeElem, worldMat, fillMap, strokeMap) {
 
         if (f0s) {
             const idx = parseInt(f0s)
-            if (!fillMap.has(idx)) fillMap.set(idx, { color: getFillColor(shapeElem, idx), segs: [] })
+            if (!fillMap.has(idx)) {
+                const fill = getFill(shapeElem, idx)
+                // Compose gradient matrix with worldMat so it lives in the same
+                // coordinate space as the tessellated vertices.
+                if (fill.type !== 'solid' && !isIdentity(worldMat)) {
+                    fill.matrix = composeMat(worldMat, fill.matrix)
+                }
+                fillMap.set(idx, { fill, segs: [] })
+            }
             for (const s of segs) fillMap.get(idx).segs.push(applyMatToSeg(worldMat, s))
         }
         if (f1s) {
             const idx = parseInt(f1s)
-            if (!fillMap.has(idx)) fillMap.set(idx, { color: getFillColor(shapeElem, idx), segs: [] })
+            if (!fillMap.has(idx)) {
+                const fill = getFill(shapeElem, idx)
+                if (fill.type !== 'solid' && !isIdentity(worldMat)) {
+                    fill.matrix = composeMat(worldMat, fill.matrix)
+                }
+                fillMap.set(idx, { fill, segs: [] })
+            }
             for (const s of segs) fillMap.get(idx).segs.push(applyMatToSeg(worldMat, reverseSeg(s)))
         }
         if (sss) {
@@ -237,16 +262,8 @@ function shapeToRegions(shapeElem, worldMat, fillMap, strokeMap) {
     return { fillMap, strokeMap }
 }
 
-// Legacy fill-only wrapper (used by flat-mode traversal paths).
-function shapeToFillRegions(shapeElem, worldMat, fillMap) {
-    return shapeToRegions(shapeElem, worldMat, fillMap ?? new Map(), new Map()).fillMap
-}
-
 // ── Active frame ────────────────────────────────────────────────────────────
 
-// Returns the DOMFrame active at frameNum, implementing Flash's "hold last keyframe"
-// rule: a keyframe's content persists past its explicit duration until the next
-// keyframe starts. This matches Flash's default layer behaviour for static geometry.
 function activeFrame(layerElem, frameNum) {
     const framesElem = childByLocalName(layerElem, 'frames')
     if (!framesElem) return null
@@ -255,13 +272,132 @@ function activeFrame(layerElem, frameNum) {
         if (f.localName !== 'DOMFrame') continue
         const idx = parseInt(f.getAttribute('index') ?? '0')
         const dur = parseInt(f.getAttribute('duration') ?? '1')
-        if (idx <= frameNum && frameNum < idx + dur) return f   // exact match
-        if (idx <= frameNum) best = f                           // last keyframe before frameNum
+        if (idx <= frameNum && frameNum < idx + dur) return f
+        if (idx <= frameNum) best = f
     }
     return best
 }
 
-// ── Group traversal ────────────────────────────────────────────────────────
+// ── Group traversal (direct geometry only) ────────────────────────────────
+
+function collectGroupDirect(groupElem, parentMat, regions) {
+    const groupMat = readMatrix(groupElem)
+    const effMat   = isIdentity(groupMat) ? parentMat : composeMat(parentMat, groupMat)
+    const members  = childByLocalName(groupElem, 'members')
+    if (!members) return
+    for (const child of members.children) {
+        const ln = child.localName
+        if (ln === 'DOMShape') {
+            const sm       = readMatrix(child)
+            const suppress = matsEqual(sm, groupMat)
+            const sMat     = suppress ? effMat : composeMat(effMat, sm)
+            const { fillMap, strokeMap } = shapeToRegions(child, sMat)
+            for (const { fill, segs }         of fillMap.values())   if (segs.length) regions.push({ type: 'fill',   fill, segs })
+            for (const { color, width, segs } of strokeMap.values()) if (segs.length) regions.push({ type: 'stroke', color, width, segs })
+        } else if (ln === 'DOMGroup') {
+            collectGroupDirect(child, effMat, regions)
+        }
+    }
+}
+
+// ── Direct-geometry collector ──────────────────────────────────────────────
+// Returns an array of render groups preserving mask layer relationships.
+//
+// Each group is one of:
+//   { type: 'plain',  regions: [...] }
+//   { type: 'masked', maskRegions: [...], contentRegions: [...] }
+//
+// Groups are in back-to-front (painter's) order.
+// Mask layer relationship is determined via parentLayerIndex (same as FLA-RE).
+
+function collectDirectRegions(doc, frameNum) {
+    const regions    = []
+    const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
+    if (!layersElem) return []
+
+    const allLayers = Array.from(layersElem.children)
+
+    // Build mask group mappings — mirrors FLA-RE's mask_groups / consumed sets.
+    // maskGroups: maskLayerIndex → [maskedLayerIndex, ...] (front-to-back order)
+    const maskGroups = new Map()
+    const consumed   = new Set()
+    for (let i = 0; i < allLayers.length; i++) {
+        const ps = allLayers[i].getAttribute('parentLayerIndex')
+        if (ps === null) continue
+        const pi = parseInt(ps)
+        if (allLayers[pi]?.getAttribute('layerType') === 'mask') {
+            if (!maskGroups.has(pi)) maskGroups.set(pi, [])
+            maskGroups.get(pi).push(i)
+            consumed.add(i)
+        }
+    }
+
+    // Collect all direct regions from a single layer frame.
+    function layerRegions(layer) {
+        const frame = activeFrame(layer, frameNum)
+        if (!frame) return []
+        const elements = childByLocalName(frame, 'elements')
+        if (!elements) return []
+        const out = []
+        for (const elem of elements.children) {
+            const ln = elem.localName
+            if (ln === 'DOMShape') {
+                const shapeMat = readMatrix(elem)
+                const { fillMap, strokeMap } = shapeToRegions(elem, shapeMat)
+                for (const { fill, segs }         of fillMap.values())   if (segs.length) out.push({ type: 'fill',   fill, segs })
+                for (const { color, width, segs } of strokeMap.values()) if (segs.length) out.push({ type: 'stroke', color, width, segs })
+            } else if (ln === 'DOMGroup') {
+                collectGroupDirect(elem, IDENTITY, out)
+            }
+            // DOMSymbolInstance: skip — becomes a child instance in the hierarchy
+        }
+        return out
+    }
+
+    const groups      = []
+    let plainRegions  = []
+
+    // Iterate layers back-to-front (reversed from Flash's front-to-back XML order).
+    for (let i = allLayers.length - 1; i >= 0; i--) {
+        const layer = allLayers[i]
+        const ltype = layer.getAttribute('layerType') ?? 'normal'
+        if (ltype === 'guide' || ltype === 'folder') continue
+        if (consumed.has(i)) continue   // handled inside its mask group below
+
+        if (ltype === 'mask' && maskGroups.has(i)) {
+            // Finalize any accumulated plain regions before the mask group.
+            if (plainRegions.length) {
+                groups.push({ type: 'plain', regions: plainRegions })
+                plainRegions = []
+            }
+
+            const maskRegions    = layerRegions(layer)
+            const contentRegions = []
+            // Masked layers are front-to-back in maskGroups; reverse for back-to-front rendering.
+            for (const mi of [...maskGroups.get(i)].reverse()) {
+                contentRegions.push(...layerRegions(allLayers[mi]))
+            }
+
+            if (maskRegions.length && contentRegions.length) {
+                groups.push({ type: 'masked', maskRegions, contentRegions })
+            } else {
+                // Degenerate — render content unmasked (matches FLA-RE behaviour).
+                plainRegions.push(...contentRegions)
+            }
+        } else {
+            plainRegions.push(...layerRegions(layer))
+        }
+    }
+
+    if (plainRegions.length) groups.push({ type: 'plain', regions: plainRegions })
+    return groups
+}
+
+// ── Legacy flat traversal (unused by hierarchy importer, kept for completeness) ──
+
+function shapeToFillRegions(shapeElem, worldMat, fillMap) {
+    return shapeToRegions(shapeElem, worldMat, fillMap ?? new Map(), new Map()).fillMap
+}
 
 function collectGroupRegions(groupElem, parentMat, symbolMap, frameNum, visited, fillMap) {
     const groupMat = readMatrix(groupElem)
@@ -290,67 +426,6 @@ function collectGroupRegions(groupElem, parentMat, symbolMap, frameNum, visited,
     }
 }
 
-// ── Symbol traversal ───────────────────────────────────────────────────────
-
-// Traverses the symbol hierarchy from `name`, accumulating fill regions
-// (segments already in world / root-local space via mat).
-// Uses a flat Map<fillIdx, {color, segs}> to accumulate across all shapes —
-// separate fills per shape to preserve distinct colors.
-// Actually: each shape has its own fill indices that are local to that shape.
-// Two shapes can both have fillStyle0="1" but different colors.
-// So we can't use a single Map keyed by fillIdx across shapes.
-// Instead we collect an array of {color, segs} entries.
-
-function collectSymbolRegions(name, symbolMap, frameNum, mat, visited, out) {
-    if (visited.has(name)) return
-    visited.add(name)
-
-    const doc = symbolMap.get(name)
-    if (!doc) return
-
-    const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
-    if (!layersElem) return
-
-    // Flash XML: layer 0 = topmost. Reverse to accumulate back-to-front.
-    for (const layer of Array.from(layersElem.children).reverse()) {
-        const ltype = layer.getAttribute('layerType') ?? 'normal'
-        // Skip non-rendered layer types. Mask layers skipped for now (no stencil yet).
-        if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-
-        const frame = activeFrame(layer, frameNum)
-        if (!frame) continue
-        const elements = childByLocalName(frame, 'elements')
-        if (!elements) continue
-
-        for (const elem of elements.children) {
-            const ln = elem.localName
-            if (ln === 'DOMShape') {
-                const shapeMat  = readMatrix(elem)
-                const effectMat = isIdentity(shapeMat) ? mat : composeMat(mat, shapeMat)
-                // Each shape gets its own fill map so fill indices don't collide across shapes
-                const fillMap = new Map()
-                shapeToFillRegions(elem, effectMat, fillMap)
-                for (const { color, segs } of fillMap.values()) {
-                    if (segs.length) out.push({ color, segs })
-                }
-            } else if (ln === 'DOMGroup') {
-                // Groups also get their own fill accumulator per shape inside
-                const groupOut = []
-                collectGroupRegionsFlat(elem, mat, symbolMap, frameNum, visited, groupOut)
-                out.push(...groupOut)
-            } else if (ln === 'DOMSymbolInstance') {
-                const cName = elem.getAttribute('libraryItemName')
-                if (!cName || visited.has(cName)) continue
-                const ff   = parseInt(elem.getAttribute('firstFrame') ?? '0')
-                const iMat = readMatrix(elem)
-                const wMat = isIdentity(iMat) ? mat : composeMat(mat, iMat)
-                collectSymbolRegions(cName, symbolMap, ff, wMat, new Set(visited), out)
-            }
-        }
-    }
-}
-
-// Group traversal variant that pushes to a flat array (one entry per shape fill region).
 function collectGroupRegionsFlat(groupElem, parentMat, symbolMap, frameNum, visited, out) {
     const groupMat = readMatrix(groupElem)
     const effMat   = isIdentity(groupMat) ? parentMat : composeMat(parentMat, groupMat)
@@ -365,8 +440,8 @@ function collectGroupRegionsFlat(groupElem, parentMat, symbolMap, frameNum, visi
             const sMat     = suppress ? effMat : composeMat(effMat, shapeMat)
             const fillMap  = new Map()
             shapeToFillRegions(child, sMat, fillMap)
-            for (const { color, segs } of fillMap.values()) {
-                if (segs.length) out.push({ color, segs })
+            for (const { fill, segs } of fillMap.values()) {
+                if (segs.length) out.push({ fill, segs })
             }
         } else if (ln === 'DOMGroup') {
             collectGroupRegionsFlat(child, effMat, symbolMap, frameNum, visited, out)
@@ -382,9 +457,59 @@ function collectGroupRegionsFlat(groupElem, parentMat, symbolMap, frameNum, visi
     }
 }
 
+function collectSymbolRegions(name, symbolMap, frameNum, mat, visited, out) {
+    if (visited.has(name)) return
+    visited.add(name)
+
+    const doc = symbolMap.get(name)
+    if (!doc) return
+
+    const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
+    if (!layersElem) return
+
+    for (const layer of Array.from(layersElem.children).reverse()) {
+        const ltype = layer.getAttribute('layerType') ?? 'normal'
+        if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
+
+        const frame = activeFrame(layer, frameNum)
+        if (!frame) continue
+        const elements = childByLocalName(frame, 'elements')
+        if (!elements) continue
+
+        for (const elem of elements.children) {
+            const ln = elem.localName
+            if (ln === 'DOMShape') {
+                const shapeMat  = readMatrix(elem)
+                const effectMat = isIdentity(shapeMat) ? mat : composeMat(mat, shapeMat)
+                const fillMap   = new Map()
+                shapeToFillRegions(elem, effectMat, fillMap)
+                for (const { fill, segs } of fillMap.values()) {
+                    if (segs.length) out.push({ fill, segs })
+                }
+            } else if (ln === 'DOMGroup') {
+                const groupOut = []
+                collectGroupRegionsFlat(elem, mat, symbolMap, frameNum, visited, groupOut)
+                out.push(...groupOut)
+            } else if (ln === 'DOMSymbolInstance') {
+                const cName = elem.getAttribute('libraryItemName')
+                if (!cName || visited.has(cName)) continue
+                const ff   = parseInt(elem.getAttribute('firstFrame') ?? '0')
+                const iMat = readMatrix(elem)
+                const wMat = isIdentity(iMat) ? mat : composeMat(mat, iMat)
+                collectSymbolRegions(cName, symbolMap, ff, wMat, new Set(visited), out)
+            }
+        }
+    }
+}
+
+function composeFillRegions(rootName, symbolMap, frameNum = 0) {
+    const out = []
+    collectSymbolRegions(rootName, symbolMap, frameNum, IDENTITY, new Set(), out)
+    return out
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
-// Build a symbol map from the {path: xmlString} object returned by fla:open.
 function buildSymbolMap(libXmls) {
     const map = new Map()
     for (const xmlStr of Object.values(libXmls)) {
@@ -397,7 +522,6 @@ function buildSymbolMap(libXmls) {
     return map
 }
 
-// Find root symbols: not referenced by any other symbol.
 function findRoots(symbolMap) {
     const referenced = new Set()
     for (const doc of symbolMap.values()) {
@@ -409,86 +533,7 @@ function findRoots(symbolMap) {
     return [...symbolMap.keys()].filter(n => !referenced.has(n)).sort()
 }
 
-// Compose a symbol hierarchy at frameNum, returning a flat array of
-// { color: [r,g,b,a], segs: Seg[] } — one entry per fill region per shape.
-// All segment coordinates are in the root symbol's local space.
-function composeFillRegions(rootName, symbolMap, frameNum = 0) {
-    const out = []
-    collectSymbolRegions(rootName, symbolMap, frameNum, IDENTITY, new Set(), out)
-    return out
-}
-
-// ── Direct-geometry collector ──────────────────────────────────────────────
-// Like collectSymbolRegions but stops at DOMSymbolInstance boundaries.
-// Returns only the fill regions from shapes/groups directly in the symbol's
-// own layers — child instances are left to the hierarchy builder.
-// Layers are iterated back-to-front so the resulting array is painter-ordered.
-
-// regions: ordered array of { type:'fill'|'stroke', color, segs, width? }
-// Fills and strokes are interleaved per-shape to preserve Flash paint order.
-function collectGroupDirect(groupElem, parentMat, regions) {
-    const groupMat = readMatrix(groupElem)
-    const effMat   = isIdentity(groupMat) ? parentMat : composeMat(parentMat, groupMat)
-    const members  = childByLocalName(groupElem, 'members')
-    if (!members) return
-    for (const child of members.children) {
-        const ln = child.localName
-        if (ln === 'DOMShape') {
-            const sm       = readMatrix(child)
-            const suppress = matsEqual(sm, groupMat)
-            const sMat     = suppress ? effMat : composeMat(effMat, sm)
-            const { fillMap, strokeMap } = shapeToRegions(child, sMat)
-            // fills before strokes within each shape — matches Flash/SVG paint order
-            for (const { color, segs }        of fillMap.values())   if (segs.length) regions.push({ type: 'fill',   color, segs })
-            for (const { color, width, segs } of strokeMap.values()) if (segs.length) regions.push({ type: 'stroke', color, width, segs })
-        } else if (ln === 'DOMGroup') {
-            collectGroupDirect(child, effMat, regions)
-        }
-        // DOMSymbolInstance inside a group: skip — becomes a child instance
-    }
-}
-
-// Returns an ordered array of { type, color, segs, width? } — fills and strokes
-// interleaved per shape so the caller can tessellate in correct paint order.
-function collectDirectRegions(doc, frameNum) {
-    const regions    = []
-    const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
-    if (!layersElem) return regions
-
-    // Reverse = back-to-front (XML order is front-to-back)
-    for (const layer of Array.from(layersElem.children).reverse()) {
-        const ltype = layer.getAttribute('layerType') ?? 'normal'
-        if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-        const frame = activeFrame(layer, frameNum)
-        if (!frame) continue
-        const elements = childByLocalName(frame, 'elements')
-        if (!elements) continue
-
-        for (const elem of elements.children) {
-            const ln = elem.localName
-            if (ln === 'DOMShape') {
-                const shapeMat = readMatrix(elem)
-                const { fillMap, strokeMap } = shapeToRegions(elem, shapeMat)
-                for (const { color, segs }        of fillMap.values())   if (segs.length) regions.push({ type: 'fill',   color, segs })
-                for (const { color, width, segs } of strokeMap.values()) if (segs.length) regions.push({ type: 'stroke', color, width, segs })
-            } else if (ln === 'DOMGroup') {
-                collectGroupDirect(elem, IDENTITY, regions)
-            }
-            // DOMSymbolInstance: skip — child instances are built by parseHierarchy
-        }
-    }
-    return regions
-}
-
 // ── Hierarchy builder ──────────────────────────────────────────────────────
-// Walks the FLA symbol tree depth-first, collecting:
-//   symbolGeometry — Map<symbolName, regions[]> (geometry in each symbol's local space)
-//   rootNode       — InstanceNode tree (mirrors the FLA instance hierarchy)
-//
-// InstanceNode: { symbolName, rawMatrix, order, label, children }
-//   rawMatrix — the Flash affine matrix [a,b,c,d,tx,ty] on this instance
-//   order     — render order within siblings (ascending = back-to-front)
-//   label     — short display name for the outliner
 
 let _hierarchyIdCounter = 0
 
@@ -517,15 +562,12 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
         const allLayers = Array.from(layersElem.children)
         const children  = []
 
-        // Collect DOMSymbolInstances from elements, recursing into DOMGroups.
-        // groupAccMat: accumulated group matrix (group local → symbol local).
         function collectInstances(elems, groupAccMat, renderOrder) {
             for (const elem of elems) {
                 if (elem.localName === 'DOMSymbolInstance') {
                     const childName = elem.getAttribute('libraryItemName')
                     if (!childName) continue
                     const iMat     = readMatrix(elem)
-                    // Compose: group chain first, then instance placement.
                     const finalMat = isIdentity(groupAccMat) ? iMat : composeMat(groupAccMat, iMat)
                     const ff       = parseInt(elem.getAttribute('firstFrame') ?? '0')
                     const lbl      = childName.split('/').pop().replace(/^~/, '')
@@ -543,12 +585,11 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
             const layer = allLayers[i]
             const ltype = layer.getAttribute('layerType') ?? 'normal'
             if (ltype === 'guide' || ltype === 'folder' || ltype === 'mask') continue
-            const frame = activeFrame(layer, fn)   // fn = this symbol's own frame, NOT the root's
+            const frame = activeFrame(layer, fn)
             if (!frame) continue
             const elements = childByLocalName(frame, 'elements')
             if (!elements) continue
 
-            // FLA layer 0 = topmost; renderOrder ascending = back-to-front
             const renderOrder = allLayers.length - i
             collectInstances(Array.from(elements.children), IDENTITY, renderOrder)
         }

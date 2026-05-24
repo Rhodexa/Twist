@@ -102,7 +102,7 @@ header.textContent = 'Scene'
 const tree = document.createElement('div')
 tree.id = 'outliner-tree'
 
-panel.appendChild(header)
+//panel.appendChild(header)
 panel.appendChild(tree)
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
