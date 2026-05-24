@@ -31,11 +31,14 @@ let _currentValue   = null    // display string shown in overlay
 function _decomposeRawMatrix(inst) {
     if (!inst.rawMatrix) return
     const [a, b, c, d, tx, ty] = inst.rawMatrix
+    const det = a * d - b * c
     inst.transform.x        = tx
     inst.transform.y        = ty
     inst.transform.rotation = Math.atan2(b, a)
     inst.transform.scaleX   = Math.sqrt(a * a + b * b)
-    inst.transform.scaleY   = Math.sqrt(c * c + d * d)
+    // Preserve the flip: if det < 0 the matrix includes a reflection.
+    // Negating scaleY encodes it so instanceToModelMatrix reproduces it exactly.
+    inst.transform.scaleY   = (det < 0 ? -1 : 1) * Math.sqrt(c * c + d * d)
     inst.rawMatrix = null
 }
 
@@ -135,10 +138,14 @@ function _apply(cur) {
     } else if (_mode === 's') {
         const pivotW = _pivotWorld ?? { x: _startTransform.x, y: _startTransform.y }
         const pivotS = viewport.worldToScreen(pivotW.x, pivotW.y)
-        const d0 = Math.hypot(_refScreen.x - pivotS.x, _refScreen.y - pivotS.y)
-        if (d0 < 1) return
-        const d1     = Math.hypot(cur.x - pivotS.x, cur.y - pivotS.y)
-        const factor = d1 / d0
+        const dx0 = _refScreen.x - pivotS.x,  dy0 = _refScreen.y - pivotS.y
+        const len0 = Math.hypot(dx0, dy0)
+        if (len0 < 1) return
+        // Signed projection onto the reference direction — allows negative scale
+        // (flip) when dragging past the pivot.
+        const ux     = dx0 / len0,  uy = dy0 / len0
+        const signed = (cur.x - pivotS.x) * ux + (cur.y - pivotS.y) * uy
+        const factor = signed / len0
         if (_axis === 'x') {
             inst.transform.scaleX = _startTransform.scaleX * factor
         } else if (_axis === 'y') {

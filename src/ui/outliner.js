@@ -24,6 +24,15 @@ function buildChildrenMap() {
     return map
 }
 
+// Collapse every node that has children. Called on init and scene reload.
+function collapseAll() {
+    const childrenOf = buildChildrenMap()
+    collapsed.clear()
+    for (const pid of childrenOf.keys())
+        if (pid !== null) collapsed.add(pid)
+    render()
+}
+
 function symbolLabel(inst) {
     // Use instance label if set, otherwise fall back to symbol name
     if (inst.label) return inst.label
@@ -97,20 +106,37 @@ function render() {
 
 const header = document.createElement('div')
 header.className = 'outliner-header'
-header.textContent = 'Scene'
+header.style.cssText = 'display:flex;align-items:center;justify-content:space-between'
+
+const headerTitle = document.createElement('span')
+headerTitle.textContent = 'Scene'
+header.appendChild(headerTitle)
+
+const collapseBtn = document.createElement('button')
+collapseBtn.textContent = '⊟'
+collapseBtn.title = 'Collapse all'
+collapseBtn.style.cssText = [
+    'background:none', 'border:none', 'cursor:pointer',
+    'color:var(--text-secondary)', 'font-size:13px',
+    'padding:0 2px', 'line-height:1', 'opacity:0.7',
+].join(';')
+collapseBtn.addEventListener('mouseenter', () => { collapseBtn.style.opacity = '1' })
+collapseBtn.addEventListener('mouseleave', () => { collapseBtn.style.opacity = '0.7' })
+collapseBtn.addEventListener('click', collapseAll)
+header.appendChild(collapseBtn)
 
 const tree = document.createElement('div')
 tree.id = 'outliner-tree'
 
-//panel.appendChild(header)
+panel.appendChild(header)
 panel.appendChild(tree)
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 function initOutliner() {
-    document.addEventListener('twist:sceneChanged',    render)
+    document.addEventListener('twist:sceneChanged',    collapseAll)
     document.addEventListener('twist:selectionChanged', render)
-    render()
+    collapseAll()   // start collapsed
 }
 
 export { initOutliner, render as refreshOutliner }
