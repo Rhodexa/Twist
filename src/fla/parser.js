@@ -61,6 +61,72 @@ function matsEqual(a, b) {
     return true
 }
 
+// ── Motion tween interpolation ─────────────────────────────────────────────
+
+function _decomposeMatrix([a, b, c, d, tx, ty]) {
+    return {
+        tx, ty,
+        scaleX:   Math.sqrt(a*a + b*b),
+        scaleY:   Math.sqrt(c*c + d*d),
+        rotation: Math.atan2(b, a),
+    }
+}
+
+function _recomposeMatrix({ tx, ty, scaleX, scaleY, rotation }) {
+    const cos = Math.cos(rotation), sin = Math.sin(rotation)
+    return [scaleX*cos, scaleX*sin, -scaleY*sin, scaleY*cos, tx, ty]
+}
+
+function _lerpAngle(a, b, t) {
+    let d = b - a
+    while (d >  Math.PI) d -= 2*Math.PI
+    while (d < -Math.PI) d += 2*Math.PI
+    return a + d*t
+}
+
+function _lerpMatrix(m0, m1, t) {
+    const d0 = _decomposeMatrix(m0), d1 = _decomposeMatrix(m1)
+    const lerp = (a, b) => a + (b - a)*t
+    return _recomposeMatrix({
+        tx:       lerp(d0.tx,       d1.tx),
+        ty:       lerp(d0.ty,       d1.ty),
+        scaleX:   lerp(d0.scaleX,   d1.scaleX),
+        scaleY:   lerp(d0.scaleY,   d1.scaleY),
+        rotation: _lerpAngle(d0.rotation, d1.rotation, t),
+    })
+}
+
+// Cubic bezier on 1-D control points (for CustomEase y given param u)
+function _cubicBezier(p0, p1, p2, p3, u) {
+    const mu = 1 - u
+    return mu*mu*mu*p0 + 3*mu*mu*u*p1 + 3*mu*u*u*p2 + u*u*u*p3
+}
+
+// Build eased-t function from a DOMFrame's <tweens> / <CustomEase> element.
+// Returns null if no custom ease is present (caller uses raw linear t).
+function _buildEaseFn(frameElem) {
+    const tweens = childByLocalName(frameElem, 'tweens')
+    if (!tweens) return null
+    const ce = childByLocalName(tweens, 'CustomEase')
+    if (!ce) return null
+    const pts = Array.from(ce.children).map(pt => ({
+        x: parseFloat(pt.getAttribute('x') ?? '0'),
+        y: parseFloat(pt.getAttribute('y') ?? '0'),
+    }))
+    if (pts.length < 4) return null
+    return (t) => {
+        // Binary-search for bezier parameter u whose x ≈ t, then return y(u).
+        let lo = 0, hi = 1
+        for (let i = 0; i < 20; i++) {
+            const mid = (lo + hi) / 2
+            if (_cubicBezier(pts[0].x, pts[1].x, pts[2].x, pts[3].x, mid) < t) lo = mid
+            else hi = mid
+        }
+        const u = (lo + hi) / 2
+        return _cubicBezier(pts[0].y, pts[1].y, pts[2].y, pts[3].y, u)
+    }
+}
+
 // ── Edge parsing ───────────────────────────────────────────────────────────
 
 function decodeHex(tok) {
@@ -276,6 +342,41 @@ function activeFrame(layerElem, frameNum) {
         if (idx <= frameNum) best = f
     }
     return best
+}
+
+// Returns the DOMFrame immediately following currentFrame in the same layer.
+function nextKeyframe(layerElem, currentFrame) {
+    const framesElem = childByLocalName(layerElem, 'frames')
+    if (!framesElem) return null
+    const curIdx = parseInt(currentFrame.getAttribute('index') ?? '0')
+    for (const f of framesElem.children) {
+        if (f.localName !== 'DOMFrame') continue
+        if (parseInt(f.getAttribute('index') ?? '0') > curIdx) return f
+    }
+    return null
+}
+
+// Total frame count for a parsed symbol document (cached by doc object identity).
+const _frameCountCache = new WeakMap()
+function _getDocFrameCount(doc) {
+    if (_frameCountCache.has(doc)) return _frameCountCache.get(doc)
+    const layersElem = doc.getElementsByTagNameNS(XFL_NS, 'layers')[0]
+    let max = 1
+    if (layersElem) {
+        for (const layer of layersElem.children) {
+            for (const child of layer.children) {
+                if (child.localName !== 'frames') continue
+                for (const f of child.children) {
+                    if (f.localName !== 'DOMFrame') continue
+                    const idx = parseInt(f.getAttribute('index') ?? '0')
+                    const dur = parseInt(f.getAttribute('duration') ?? '1')
+                    max = Math.max(max, idx + dur)
+                }
+            }
+        }
+    }
+    _frameCountCache.set(doc, max)
+    return max
 }
 
 // ── Group traversal (direct geometry only) ────────────────────────────────
@@ -637,21 +738,52 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
             if (allLayers[pi]?.getAttribute('layerType') === 'mask') maskGroupOf.set(i, pi)
         }
 
-        function collectInstances(elems, groupAccMat, renderOrder, layerMaskIdx) {
+        // frameStart: the DOMFrame's own index attribute (when this keyframe begins).
+        // tweenNextElems: array of DOMSymbolInstances from the next keyframe (for matrix lerp), or null.
+        // tweenT: interpolation factor [0,1] with easing applied.
+        function collectInstances(elems, groupAccMat, renderOrder, layerMaskIdx, frameStart, tweenNextInsts, tweenT) {
+            let instIdx = 0
             for (const elem of elems) {
                 if (elem.localName === 'DOMSymbolInstance') {
                     const childName = elem.getAttribute('libraryItemName')
                     if (!childName) continue
-                    const iMat     = readMatrix(elem)
+
+                    // Matrix — interpolate if inside a motion tween span.
+                    let iMat = readMatrix(elem)
+                    if (tweenNextInsts && tweenT > 0) {
+                        const peer = tweenNextInsts[instIdx]
+                        if (peer) iMat = _lerpMatrix(iMat, readMatrix(peer), tweenT)
+                    }
+                    instIdx++
+
                     const finalMat = isIdentity(groupAccMat) ? iMat : composeMat(groupAccMat, iMat)
-                    const ff       = parseInt(elem.getAttribute('firstFrame') ?? '0')
-                    const lbl      = childName.split('/').pop().replace(/^~/, '')
-                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, ff, layerMaskIdx))
+
+                    // Child frame — respects graphic symbol loop mode.
+                    const loop       = elem.getAttribute('loop') ?? 'loop'
+                    const firstFrame = parseInt(elem.getAttribute('firstFrame') ?? '0')
+                    let childFn
+                    if (loop === 'single frame') {
+                        childFn = firstFrame
+                    } else {
+                        const elapsed   = fn - frameStart
+                        const raw       = firstFrame + elapsed
+                        const childDoc  = symbolMap.get(childName)
+                        const total     = childDoc ? _getDocFrameCount(childDoc) : 1
+                        if (loop === 'loop') {
+                            childFn = ((raw % total) + total) % total
+                        } else {
+                            // 'play once' — clamp at last frame
+                            childFn = Math.min(raw, total - 1)
+                        }
+                    }
+
+                    const lbl = childName.split('/').pop().replace(/^~/, '')
+                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, childFn, layerMaskIdx))
                 } else if (elem.localName === 'DOMGroup') {
                     const gMat    = readMatrix(elem)
                     const newAcc  = isIdentity(gMat) ? groupAccMat : composeMat(groupAccMat, gMat)
                     const members = childByLocalName(elem, 'members')
-                    if (members) collectInstances(Array.from(members.children), newAcc, renderOrder, layerMaskIdx)
+                    if (members) collectInstances(Array.from(members.children), newAcc, renderOrder, layerMaskIdx, frameStart, tweenNextInsts, tweenT)
                 }
             }
         }
@@ -667,7 +799,25 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
 
             const renderOrder  = allLayers.length - i
             const layerMaskIdx = maskGroupOf.get(i) ?? null
-            collectInstances(Array.from(elements.children), IDENTITY, renderOrder, layerMaskIdx)
+            const frameStart   = parseInt(frame.getAttribute('index') ?? '0')
+
+            // Motion tween: collect next-keyframe instances and compute eased t.
+            let tweenNextInsts = null, tweenT = 0
+            if (frame.getAttribute('tweenType') === 'motion') {
+                const nextFrame = nextKeyframe(layer, frame)
+                if (nextFrame) {
+                    const nextIdx   = parseInt(nextFrame.getAttribute('index') ?? '0')
+                    const rawT      = (fn - frameStart) / (nextIdx - frameStart)
+                    const easeFn    = _buildEaseFn(frame)
+                    tweenT          = Math.max(0, Math.min(1, easeFn ? easeFn(rawT) : rawT))
+                    const nextElems = childByLocalName(nextFrame, 'elements')
+                    tweenNextInsts  = nextElems
+                        ? Array.from(nextElems.children).filter(e => e.localName === 'DOMSymbolInstance')
+                        : []
+                }
+            }
+
+            collectInstances(Array.from(elements.children), IDENTITY, renderOrder, layerMaskIdx, frameStart, tweenNextInsts, tweenT)
         }
 
         children.sort((a, b) => a.order - b.order)
