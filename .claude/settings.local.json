@@ -8,7 +8,8 @@
       "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/*'\\)[:5]\\)\")",
       "Bash(python3 -c \"import glob; print\\(glob.glob\\('FLA-RE/**/*.fla', recursive=True\\)[:5]\\)\")",
       "Bash(dir \"c:\\\\Users\\\\Celestia\\\\Desktop\\\\Rhode\\\\FLA-RE\")",
-      "Bash(python -m py_compile fla_export_gui.py)"
+      "Bash(python -m py_compile fla_export_gui.py)",
+      "PowerShell(\\(Get-Content \"C:\\\\Users\\\\Celestia\\\\Desktop\\\\Rhode\\\\FLA-RE\\\\fla\\\\S08E23\\\\MLP823_027\\\\DOMDocument.xml\" -Raw\\).Length)"
     ]
   }
 }

@@ -24,10 +24,11 @@ export function initTimelineUI() {
     // Play / pause button
     btnPlay.addEventListener('click', () => togglePlay())
 
-    // Scrubbing — update frame and redraw immediately
+    // Scrubbing — update frame and notify listeners (import.js listens for twist:frameChange)
     scrubEl.addEventListener('input', () => {
         scene.timeline.currentFrame = parseInt(scrubEl.value)
         frameEl.textContent = scrubEl.value
+        document.dispatchEvent(new CustomEvent('twist:frameChange'))
         viewport.markDirty()
     })
 

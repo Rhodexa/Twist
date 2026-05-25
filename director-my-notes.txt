@@ -1,0 +1,182 @@
+This is fun!
+What should we tackle next? So i get to fully understand... we are currently in DOMDocument right? from here... scene... and then what?
+
+Ok, it is my turn to talk for a long while and think to myself like you do. Hopefully the way i reason through this could give you some clues on my psyche while i think outloud for my own benefit lol
+
+So, DOMDocument has a reference to scene.xml, right?
+<DOMTimeline name="Scene 1" currentFrame="91"> <!-- What is a timeline really? what is currentFrame? Useful data or a left over? something else? -->
+It declares only one thing: <layers/>
+Which i have to assume, intuitively, this is a way Flash says "this is an array of layers"? 
+I will guess these are declared in order from front to back.
+That's where you get your CAM GUIDE a, b _SCENE_ then board, and i guess Audio is a renderless object. Is this just a hack? Like, Import a mesh-less layer which imports its own audio? Or Flash has its own Audio layer _type_?
+<DOMLayer name="AUDIO" color="#9933CC" locked="true" autoNamed="false">
+        <frames>
+            <DOMFrame index="0" duration="96" keyMode="9728" soundName="MLP823_027.aif" soundSync="stream">
+                <SoundEnvelope>
+                    <SoundEnvelopePoint level0="32768" level1="32768"/>
+                </SoundEnvelope>
+                <elements/>
+            </DOMFrame>
+        </frames>
+</DOMLayer>
+
+I find it interesting that it has this soundName attribute, while being a DOMFrame. Is this what a game would use then? Can any object just bring its own snacks like this?
+Now i know this (Twist) ins't about sound, but Im poking anyway to learn
+
+I notice having something like soundName is too vague. Am I right to assume these are defined alike HTML ids attrs 
+<DOMSoundItem name="MLP823_027.aif" itemID="59ee67b7-0000000f" sourceExternalFilepath="E:/MLP/823/823_027/auto_job/aif/MLP823_027.aif" sourceLastImported="1508791070" externalFileCRC32="2304947513" externalFileSize="385258" href="MLP823_027.aif" soundDataHRef="M 1 1508796343.dat" format="44kHz 16bit Mono" sampleCount="176576" dataLength="353152"/>
+And this is what truly links against it?
+
+Now, <DOMLayer name="SCENE" color="#FFFF4F" current="true" isSelected="true" autoNamed="false"> declares an array again, right?
+<frames>
+there's only one frame:
+<DOMFrame index="0" duration="96" keyMode="9728">
+Which if i guess, it is frame 0, and lasts as is for 96 frames?
+So If I import MLP823_027 now, it should be only 96 frames long?
+Importing...
+Imported: 0/95 frames.
+hmm, interesting.
+Am I right to guess color="#FFFF4F" this is just what it would look like on the timeline? I mean, what the clip strip would look like on Flash.
+current="true" isSelected="true" autoNamed="false" These look like just Flash authoring metadata, like whether ths is the active strip and stuff.  iwonder if isSelected and current ain't pretty much the same thing
+
+<DOMFrame index="0" duration="96" keyMode="9728">
+    <elements> <- Opens a new array of Elements.
+
+I guess this is what we are calling nodes or objects. Flash calls it elements?
+Elements -> symbols, symbol instances, and... what else?
+
+There's only one element: An instance of scene
+<DOMSymbolInstance libraryItemName="scene" selected="true" symbolType="graphic" loop="loop">
+
+    Interesting, so you can have different symbol types. So to Flash a symbol wasn't the graphics i was thinking of, but a broder thing
+    Maybe Twist should distinguish between these, because Twist doesn't handle objects quite in the same way (on paper)
+    anyway... im getting ahead of myself.
+
+    It also has selected true, i guess this is also useless metadata to us.
+    Now, this bugs me:
+        <matrix>
+            <Matrix tx="432" ty="243"/>
+        </matrix>
+        <transformationPoint>
+            <Point/>
+        </transformationPoint>
+</DOMSymbolInstance>
+
+Why is <matrix> here? Isn't it a property of the symbol? shoudln't it be an attribute?
+Also, what does it mean? Do we grab the symbols transformed geometry and instance it then apply the matrix?
+or do we grab it matrix-less, then apply this matrix?
+I guess I'll know once i reach that symbol's description.
+It seems to only translate though.
+But is <matrix> also an array declaration? with only one matrix?
+Now, Point. What is it then? A pivot? an origin? does it start at 0, 0 by default?
+Why is it an array? or is this not? Being an element (XML Element) I have to guess you can syntactivally put more than one point in there
+
+It has libraryItemName="scene", but no other specification.
+<Include href="scene.xml" itemIcon="1" loadImmediate="false" itemID="46dddc2e-0000001b" lastModified="1520525410"/> is also here
+Is it that Flash infers that 'libraryItemName="scene"' means "look for scene.xml inside /LIBRARY"?
+
+Does this mean that in the previous version of Twist when we were opening scenes what we were really doing was opening scene.xml directly by hand??
+And what Flash does is instance it from its file? Wait, is Flash opening two files in the first stage before it can even begin writing the scene?
+DOMDocument.xml -> do Instance Symbol -> scene.xml -> do Instace Symbol -> everything else.
+Is a symbol and an XML literally the exact same thing semantically then?
+
+<DOMSymbolItem xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://ns.adobe.com/xfl/2008/" name="scene" itemID="46dddc2e-0000001b" sourceFlashFilepath="../Spark/user/jos@bnet/Spark/user/jos@bnet/downloads/temp.fla" sourceLibraryItemHRef="scene" sourceLastModified="1191258714" symbolType="graphic" lastModified="1520525410" sourceItemID="00000000-ffffffff">
+A lot of metadata, but i guess this is what a symbol definition looks like?
+
+So the first thing it does is also define a timeline <timeline>
+Is this also an array?
+Technically everything in XML is an array lol
+But certain elements like these begin with lowercase and have no attributes, which leads me to believe they are meant to contain arrays of same-type objects
+
+Is a timeline an array of layers and a layer an array of frames?
+Let's not make many assumtions yet
+
+Ok, i see the scene contains directly defined edges which are taking up a lot of editor space
+Imma delete the edge data but keep <Edge fillStyle1="1" edges=""/>
+Now scene.xml is only 165 lines long
+Now i see it, these must take ages to traverse. These must be parsed into actual number array objects at hardware level, not as JSON nor XML
+
+So scene.xml really looks like 
+<DOMSymbolItem xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://ns.adobe.com/xfl/2008/" name="scene" itemID="46dddc2e-0000001b" sourceFlashFilepath="../Spark/user/jos@bnet/Spark/user/jos@bnet/downloads/temp.fla" sourceLibraryItemHRef="scene" sourceLastModified="1191258714" symbolType="graphic" lastModified="1520525410" sourceItemID="00000000-ffffffff">
+<timeline>
+    <DOMTimeline name="scene" currentFrame="24">
+        <layers>
+        ...
+        </layers>
+    </DOMTimeline>
+</timeline>
+</DOMSymbolItem>
+
+currentFrame again looks like just metadata, but could it actually be an offset??
+If our theory holds, could <timeline> be an array of DOMTimeline?
+
+Now inside the <layers> array we have
+<DOMLayer name="AUDIO" color="#9933CC" locked="true" autoNamed="false"> on top?
+<DOMLayer name="NOTES" color="#9933CC" locked="true" autoNamed="false" layerType="guide"> on top? makes sense. I guess these can be disabled
+<DOMLayer name="NOTES" color="#FF800A" locked="true" autoNamed="false" layerType="guide"> NOTES again
+<DOMLayer name="~AJ" color="#FF800A" autoNamed="false"> Applejack
+<DOMLayer name="~PTS" color="#9933CC" current="true" isSelected="true" autoNamed="false"> Twilight
+they have colors in the clip strip for easy ID, fun
+Interesting how they mention layerType guide. I wonder if flash/animate auto culls these on renderless
+<DOMLayer name="mlp823_033_int_twilights_castle_throne_room_updated_w_map_co" color="#FF800A" locked="true" autoNamed="false" visible="false">
+Why does the throne have visibility explicitly enabled and the others don't?
+
+Also, the audio layer doesn't have layerType = audio or something like that, which is interesting
+
+The NOTES had the edges defined in situ. But i don't see anything referring to text in there.
+could those edges have been hand painted notes?
+<DOMFrame index="0" duration="64" keyMode="9728"> keyMode is interesting. I ahve no idea what it means
+from notes.
+
+For instance, in NOTES 2 (orange)
+There are four frames:
+0, 64, and 86. Are these "frames" actually keyframes then??
+
+Interstingly, Applejack only has 
+<DOMLayer name="~AJ" color="#FF800A" autoNamed="false">
+    <frames>
+        <DOMFrame index="0" duration="96" keyMode="9728">
+            <elements>
+                <DOMSymbolInstance libraryItemName="~FS_Character" symbolType="graphic" centerPoint3DX="-619.3" centerPoint3DY="195.6" loop="play once">
+                    <matrix>
+                        <Matrix a="2.79998779296875" d="2.79998779296875" tx="-568.4" ty="138.85"/>
+                    </matrix>
+                    <transformationPoint>
+                        <Point/>
+                    </transformationPoint>
+                </DOMSymbolInstance>
+            </elements>
+        </DOMFrame>
+    </frames>
+</DOMLayer>
+
+So it is its own layer, and has only one frame from 0 to 95 (Oh, now i get it, from 0 to 95 (0-indexed) is 96 frames total. Got it)
+it uses the same keyMode 9728
+Does this mean frames are actually nested? So the first frame of a symbol points to a sequence of frames? what if a symbol with frames has more than 1 frame on its intance?
+No.
+Wait.
+We have Frame 0 -> Use Fluttershy. That's what it means
+A different frame could then say Frame 1 -> Use Rainbow Dash. I guess _that_ is the correct understanding.
+
+And it instances... FLUTTERSHY??? What the pony?
+Well, the shot uses Fluttershy, where they planning on using AJ there?
+was ~AJ just a name they gave the layer on the moment during authoring then? hence autoname false?
+Maybe the animator had a blip there
+
+centerPoint3DX="-619.3" centerPoint3DY="195.6" loop="play once"
+Now this is particularly interesting
+3D? So... It supports 3D, at least now... interesting. I know we do all 2D, but this means they _can_ use 3D
+oof... I feel demoted now lol... USE BLENDER, I wont do 3D, not now...
+Anyway, I guess this just tells us where to place the symbol. This is consistent with the shot
+
+But then we have this again, why? Are we supposed to apply this transform and then the center point?
+Or is the centerpoint the actual pivot definition and this is where it lands on the screen?
+The matrix is more consistent then the center point. Do we even care about it? Note it down for investigation too
+<matrix>
+    <Matrix a="2.79998779296875" d="2.79998779296875" tx="-568.4" ty="138.85"/>
+</matrix>
+<transformationPoint>
+    <Point/>
+</transformationPoint>
+
+I think i understand the system better now... but still not in full

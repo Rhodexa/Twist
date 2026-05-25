@@ -777,8 +777,14 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
                         }
                     }
 
-                    const lbl = childName.split('/').pop().replace(/^~/, '')
-                    children.push(buildNode(childName, finalMat, renderOrder, lbl, visited, childFn, layerMaskIdx))
+                    const lbl   = childName.split('/').pop().replace(/^~/, '')
+                    const child = buildNode(childName, finalMat, renderOrder, lbl, visited, childFn, layerMaskIdx)
+                    // Expose placement metadata so the importer can build tracks.
+                    child.loop       = loop
+                    child.firstFrame = firstFrame
+                    child.frameStart = frameStart
+                    child.elemIdx    = instIdx - 1   // 0-based index within layer elements
+                    children.push(child)
                 } else if (elem.localName === 'DOMGroup') {
                     const gMat    = readMatrix(elem)
                     const newAcc  = isIdentity(gMat) ? groupAccMat : composeMat(groupAccMat, gMat)
@@ -829,4 +835,4 @@ function parseHierarchy(rootName, symbolMap, frameNum = 0) {
     return { symbolGeometry, rootNode }
 }
 
-export { buildSymbolMap, findRoots, composeFillRegions, parseHierarchy }
+export { buildSymbolMap, composeFillRegions, parseHierarchy, collectDirectRegions }

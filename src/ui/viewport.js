@@ -594,6 +594,11 @@ let _passeVbo   = null
 
 const checker = { enabled: true, scale: 20, opacity: 0.55 }
 
+// ── Overlay state ─────────────────────────────────────────────────────────
+
+const borderOverlay = { enabled: true, opacity: 0.5  }
+const passeOverlay  = { enabled: true, opacity: 0.55 }
+
 let _checkerProg    = null
 let _checkerScale   = null
 let _checkerOpacity = null
@@ -995,7 +1000,7 @@ const viewport = {
     },
 
     _renderPassepartout() {
-        if (!_passeProg) return
+        if (!_passeProg || !passeOverlay.enabled) return
         const cam = scene.camera
         const tl  = worldToScreen(cam.x - cam.width  / 2, cam.y - cam.height / 2)
         const br  = worldToScreen(cam.x + cam.width  / 2, cam.y + cam.height / 2)
@@ -1009,7 +1014,7 @@ const viewport = {
             -1, -1,  -1,  1,  nx0,ny0,   -1, -1,  nx0,ny0,  nx0,ny1,
         ])
         gl.useProgram(_passeProg)
-        gl.uniform4f(_passeColor, 0, 0, 0, 0.55)
+        gl.uniform4f(_passeColor, 0, 0, 0, passeOverlay.opacity)
         gl.bindVertexArray(_passeVao)
         gl.bindBuffer(gl.ARRAY_BUFFER, _passeVbo)
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, v)
@@ -1028,9 +1033,11 @@ const viewport = {
         const tl = worldToScreen(cam.x - cam.width  / 2, cam.y - cam.height / 2)
         const br = worldToScreen(cam.x + cam.width  / 2, cam.y + cam.height / 2)
         const fw = br.x - tl.x,  fh = br.y - tl.y
-        ctx2d.strokeStyle = 'rgba(255,255,255,0.18)'
-        ctx2d.lineWidth   = 1
-        ctx2d.strokeRect(Math.round(tl.x) + 0.5, Math.round(tl.y) + 0.5, Math.round(fw), Math.round(fh))
+        if (borderOverlay.enabled) {
+            ctx2d.strokeStyle = `rgba(0,0,0,${borderOverlay.opacity})`
+            ctx2d.lineWidth   = 1
+            ctx2d.strokeRect(Math.round(tl.x) + 0.5, Math.round(tl.y) + 0.5, Math.round(fw), Math.round(fh))
+        }
 
         // ── Selection boxes ──────────────────────────────────────────────
         const frame = scene.timeline.currentFrame
@@ -1181,12 +1188,13 @@ const viewport = {
             'font:11px/1 var(--font-mono,monospace)', 'color:rgba(255,255,255,0.65)',
         ].join(';')
 
+        // ToDo: Rename Extras overlay, now it is Overlays.
         const extrasBtn = document.createElement('button')
-        extrasBtn.textContent = 'Extras ▾'
+        extrasBtn.textContent = 'Overlays ▾'
         extrasBtn.style.cssText = [
             'background:rgba(255,255,255,0.06)', 'border:1px solid rgba(255,255,255,0.12)',
             'color:rgba(255,255,255,0.7)', 'font:11px/1 var(--font-mono,monospace)',
-            'padding:3px 8px', 'border-radius:4px', 'cursor:pointer',
+            'padding:5px 8px', 'border-radius:4px', 'cursor:pointer',
         ].join(';')
 
         const dropdown = document.createElement('div')
@@ -1204,7 +1212,7 @@ const viewport = {
                         color:rgba(255,255,255,0.3);margin-bottom:2px">Background</div>
             <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
                 <input type="checkbox" id="ck-enable" ${checker.enabled ? 'checked' : ''}>
-                Show checkerboard
+                Checker pattern
             </label>
             <label style="display:flex;align-items:center;gap:6px">
                 Scale
@@ -1215,6 +1223,30 @@ const viewport = {
                 Opacity
                 <input type="range" id="ck-opacity" min="0" max="1" step="0.05"
                        value="${checker.opacity}" style="flex:1;accent-color:var(--accent,#a88)">
+            </label>
+            <div style="border-top:1px solid rgba(255,255,255,0.08);margin:2px 0"></div>
+            <div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+                        color:rgba(255,255,255,0.3);margin-bottom:2px">Camera bounds</div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="bd-enable" ${borderOverlay.enabled ? 'checked' : ''}>
+                Camera bounds
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+                Opacity
+                <input type="range" id="bd-opacity" min="0" max="1" step="0.05"
+                       value="${borderOverlay.opacity}" style="flex:1;accent-color:var(--accent,#a88)">
+            </label>
+            <div style="border-top:1px solid rgba(255,255,255,0.08);margin:2px 0"></div>
+            <div style="font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+                        color:rgba(255,255,255,0.3);margin-bottom:2px">Passepartout</div>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="pp-enable" ${passeOverlay.enabled ? 'checked' : ''}>
+                Passepartout
+            </label>
+            <label style="display:flex;align-items:center;gap:6px">
+                Opacity
+                <input type="range" id="pp-opacity" min="0" max="1" step="0.05"
+                       value="${passeOverlay.opacity}" style="flex:1;accent-color:var(--accent,#a88)">
             </label>`
 
         extrasBtn.addEventListener('click', e => {
@@ -1237,6 +1269,18 @@ const viewport = {
         })
         dropdown.querySelector('#ck-opacity').addEventListener('input', e => {
             checker.opacity = parseFloat(e.target.value); this.markDirty()
+        })
+        dropdown.querySelector('#bd-enable').addEventListener('change', e => {
+            borderOverlay.enabled = e.target.checked; this.markDirty()
+        })
+        dropdown.querySelector('#bd-opacity').addEventListener('input', e => {
+            borderOverlay.opacity = parseFloat(e.target.value); this.markDirty()
+        })
+        dropdown.querySelector('#pp-enable').addEventListener('change', e => {
+            passeOverlay.enabled = e.target.checked; this.markDirty()
+        })
+        dropdown.querySelector('#pp-opacity').addEventListener('input', e => {
+            passeOverlay.opacity = parseFloat(e.target.value); this.markDirty()
         })
 
         for (const sym of scene.symbols) this.buildSymbolVaos(sym.id)
