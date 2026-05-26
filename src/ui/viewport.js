@@ -562,14 +562,23 @@ canvas.addEventListener('wheel', e => {
 
 let _prog        = null
 let _uniforms    = null
+let _clearColor  = null   // cached from cssVarToGL('--bg-base'), read once on init
 
 // _symbolVaos: symId → array of render groups
-//   plain group:  { type:'plain',  vaos: [vaoEntry, ...] }
-//   masked group: { type:'masked', maskVaos:[{vao,vertexCount},...], contentVaos:[vaoEntry,...] }
+//   plain group:  { type:'plain',  order, solidVao:{vao,vertexCount}|null, gradVaos:[gradEntry,...] }
+//   masked group: { type:'masked', order, maskId, maskBatchVao:{vao,vertexCount}|null,
+//                   solidVao:{vao,vertexCount}|null, gradVaos:[gradEntry,...] }
 //
-// vaoEntry: { fillType, color?, stopCount?, stopOffsets?, stopColors?, gradientMatInv?, vao, vertexCount }
+// solidVao: interleaved [x,y,r,g,b,a] float32, stride 24, drawn with fillType=3 in one call.
+// maskBatchVao: position-only, all mask meshes merged, drawn into stencil.
+// gradEntry: { fillType, gradientMatInv, stopCount, stopOffsets, stopColors, vao, vertexCount }
 const _symbolVaos = new Map()
 const _edgeVaos   = new Map()
+
+// childrenOf cache — rebuilt on twist:sceneChanged (covers import + frame scrub)
+let _childrenOf      = new Map()
+let _childrenOfDirty = true
+document.addEventListener('twist:sceneChanged', () => { _childrenOfDirty = true })
 
 // Compositor hover highlight — null | { instId, maskId? }
 let _hoverHighlight = null
@@ -664,10 +673,9 @@ const viewport = {
     clearSymbolVaos() {
         for (const groups of _symbolVaos.values()) {
             for (const group of groups) {
-                const entries = group.type === 'plain'
-                    ? group.vaos
-                    : [...group.maskVaos, ...group.contentVaos]
-                for (const e of entries) gl.deleteVertexArray(e.vao)
+                if (group.solidVao)     gl.deleteVertexArray(group.solidVao.vao)
+                if (group.maskBatchVao) gl.deleteVertexArray(group.maskBatchVao.vao)
+                for (const e of (group.gradVaos ?? [])) gl.deleteVertexArray(e.vao)
             }
         }
         for (const contours of _edgeVaos.values())
@@ -676,12 +684,30 @@ const viewport = {
         _edgeVaos.clear()
     },
 
+    deleteSymbolVaos(symId) {
+        const groups = _symbolVaos.get(symId)
+        if (groups) {
+            for (const group of groups) {
+                if (group.solidVao)     gl.deleteVertexArray(group.solidVao.vao)
+                if (group.maskBatchVao) gl.deleteVertexArray(group.maskBatchVao.vao)
+                for (const e of (group.gradVaos ?? [])) gl.deleteVertexArray(e.vao)
+            }
+            _symbolVaos.delete(symId)
+        }
+        const contours = _edgeVaos.get(symId)
+        if (contours) {
+            for (const { vao } of contours) gl.deleteVertexArray(vao)
+            _edgeVaos.delete(symId)
+        }
+    },
+
     buildSymbolVaos(symId) {
         if (_symbolVaos.has(symId)) return
         const sym = scene.symbols.find(s => s.id === symId)
         if (!sym) return
 
-        function makeVao(vertices) {
+        // Position-only VAO — gradients and edge overlays
+        function makePositionVao(vertices) {
             const vao = gl.createVertexArray()
             const vbo = gl.createBuffer()
             gl.bindVertexArray(vao)
@@ -693,56 +719,89 @@ const viewport = {
             return { vao, vertexCount: vertices.length / 2 }
         }
 
-        function meshToEntry(mesh) {
-            const base = makeVao(mesh.vertices)
-            if (mesh.fillType === 0) {
-                return { fillType: 0, color: new Float32Array(mesh.color), ...base }
+        // Interleaved [x,y,r,g,b,a] VBO — all solid fills in one draw call (fillType=3)
+        function makeSolidBatchVao(meshes) {
+            let totalVerts = 0
+            for (const m of meshes) totalVerts += m.vertices.length / 2
+            if (totalVerts === 0) return null
+            const data = new Float32Array(totalVerts * 6)
+            let off = 0
+            for (const m of meshes) {
+                const verts = m.vertices
+                const r = m.color[0], g = m.color[1], b = m.color[2], a = m.color[3]
+                for (let i = 0; i < verts.length; i += 2) {
+                    data[off++] = verts[i]; data[off++] = verts[i + 1]
+                    data[off++] = r;        data[off++] = g
+                    data[off++] = b;        data[off++] = a
+                }
             }
+            const vao = gl.createVertexArray()
+            const vbo = gl.createBuffer()
+            gl.bindVertexArray(vao)
+            gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
+            gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW)
+            gl.enableVertexAttribArray(0)
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0)
+            gl.enableVertexAttribArray(1)
+            gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8)
+            gl.bindVertexArray(null)
+            return { vao, vertexCount: totalVerts }
+        }
+
+        // Position-only batch VBO — mask shapes drawn into stencil (color is irrelevant)
+        function makeMaskBatchVao(meshes) {
+            let totalVerts = 0
+            for (const m of meshes) totalVerts += m.vertices.length / 2
+            if (totalVerts === 0) return null
+            const data = new Float32Array(totalVerts * 2)
+            let off = 0
+            for (const m of meshes) { data.set(m.vertices, off); off += m.vertices.length }
+            return makePositionVao(data)
+        }
+
+        function makeGradEntry(mesh) {
             return {
                 fillType:       mesh.fillType,
                 gradientMatInv: mesh.gradientMatInv,
                 stopCount:      mesh.stopCount,
                 stopOffsets:    mesh.stopOffsets,
                 stopColors:     mesh.stopColors,
-                ...base,
+                ...makePositionVao(mesh.vertices),
             }
+        }
+
+        function buildGroupContent(meshes) {
+            const solidMeshes = meshes.filter(m => m.fillType === 0)
+            const gradMeshes  = meshes.filter(m => m.fillType !== 0)
+            return { solidVao: makeSolidBatchVao(solidMeshes), gradVaos: gradMeshes.map(makeGradEntry) }
         }
 
         if (sym.renderGroups?.length) {
             _symbolVaos.set(sym.id, sym.renderGroups.map(g => {
                 if (g.type === 'plain') {
-                    return { type: 'plain', order: g.order ?? 0, vaos: g.meshes.map(meshToEntry) }
+                    return { type: 'plain', order: g.order ?? 0, ...buildGroupContent(g.meshes) }
                 }
                 return {
-                    type:        'masked',
-                    order:       g.order ?? 0,
-                    maskId:      g.maskId,
-                    maskVaos:    g.maskMeshes.map(m => makeVao(m.vertices)),
-                    contentVaos: g.contentMeshes.map(meshToEntry),
+                    type:         'masked',
+                    order:        g.order ?? 0,
+                    maskId:       g.maskId,
+                    maskBatchVao: makeMaskBatchVao(g.maskMeshes),
+                    ...buildGroupContent(g.contentMeshes),
                 }
             }))
         } else if (sym.meshes?.length) {
-            // Legacy flat mesh array — wrap in a single plain group
-            _symbolVaos.set(sym.id, [{
-                type: 'plain',
-                vaos: sym.meshes.map(m => ({
-                    fillType: 0,
-                    color:    new Float32Array(m.color),
-                    ...makeVao(m.vertices),
-                }))
-            }])
+            // Legacy flat mesh array — treat as single plain group
+            _symbolVaos.set(sym.id, [{ type: 'plain', ...buildGroupContent(sym.meshes) }])
         } else if (sym.vertices) {
             // Legacy bare single-mesh symbol (test scene)
-            _symbolVaos.set(sym.id, [{
-                type: 'plain',
-                vaos: [{ fillType: 0, color: new Float32Array(sym.color ?? [0,0,0,1]), ...makeVao(sym.vertices) }]
-            }])
+            const solidVao = makeSolidBatchVao([{ vertices: sym.vertices, color: sym.color ?? [0,0,0,1] }])
+            _symbolVaos.set(sym.id, [{ type: 'plain', solidVao, gradVaos: [] }])
         }
 
         if (sym.edgeContours?.length) {
             _edgeVaos.set(sym.id, sym.edgeContours.map(({ color, vertices }) => ({
                 color: new Float32Array(color),
-                ...makeVao(vertices),
+                ...makePositionVao(vertices),
             })))
         }
     },
@@ -787,30 +846,39 @@ const viewport = {
         gl.enable(gl.BLEND)
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
-        const childrenOf = new Map()
-        for (const inst of scene.instances) {
-            const pid = inst.parentId ?? null
-            if (!childrenOf.has(pid)) childrenOf.set(pid, [])
-            childrenOf.get(pid).push(inst)
+        // Rebuild childrenOf only when scene structure changes, not every frame.
+        if (_childrenOfDirty) {
+            _childrenOf.clear()
+            for (const inst of scene.instances) {
+                const pid = inst.parentId ?? null
+                if (!_childrenOf.has(pid)) _childrenOf.set(pid, [])
+                _childrenOf.get(pid).push(inst)
+            }
+            for (const children of _childrenOf.values())
+                children.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+            _childrenOfDirty = false
         }
-        for (const children of childrenOf.values())
-            children.sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+        const childrenOf = _childrenOf
 
         const frame = scene.timeline.currentFrame
 
-        // Draw a single mesh entry — handles solid and gradient fills.
-        const drawEntry = (entry, worldMat) => {
+        // Draw one solid batch (fillType=3: per-vertex colour from interleaved VBO).
+        const drawSolidBatch = (solidVao, worldMat) => {
+            if (!solidVao) return
             gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
-            if (entry.fillType === 0) {
-                gl.uniform1i(_uniforms.fillType, 0)
-                gl.uniform4fv(_uniforms.color, entry.color)
-            } else {
-                gl.uniform1i(_uniforms.fillType, entry.fillType)
-                gl.uniformMatrix3fv(_uniforms.gradMatInv, false, entry.gradientMatInv)
-                gl.uniform1i(_uniforms.stopCount, entry.stopCount)
-                gl.uniform1fv(_uniforms.stopOffsets, entry.stopOffsets)
-                gl.uniform4fv(_uniforms.stopColors, entry.stopColors)
-            }
+            gl.uniform1i(_uniforms.fillType, 3)
+            gl.bindVertexArray(solidVao.vao)
+            gl.drawArrays(gl.TRIANGLES, 0, solidVao.vertexCount)
+        }
+
+        // Draw one gradient entry (fillType 1 or 2, position-only VAO).
+        const drawGradEntry = (entry, worldMat) => {
+            gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
+            gl.uniform1i(_uniforms.fillType, entry.fillType)
+            gl.uniformMatrix3fv(_uniforms.gradMatInv, false, entry.gradientMatInv)
+            gl.uniform1i(_uniforms.stopCount, entry.stopCount)
+            gl.uniform1fv(_uniforms.stopOffsets, entry.stopOffsets)
+            gl.uniform4fv(_uniforms.stopColors, entry.stopColors)
             gl.bindVertexArray(entry.vao)
             gl.drawArrays(gl.TRIANGLES, 0, entry.vertexCount)
         }
@@ -827,9 +895,9 @@ const viewport = {
             gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
             gl.uniform1i(_uniforms.fillType, 0)
             gl.uniform4fv(_uniforms.color, _WHITE)
-            for (const mv of group.maskVaos) {
-                gl.bindVertexArray(mv.vao)
-                gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
+            if (group.maskBatchVao) {
+                gl.bindVertexArray(group.maskBatchVao.vao)
+                gl.drawArrays(gl.TRIANGLES, 0, group.maskBatchVao.vertexCount)
             }
             gl.colorMask(true, true, true, true)
             stencilDepth++
@@ -845,9 +913,9 @@ const viewport = {
             gl.uniformMatrix3fv(_uniforms.modelMatrix, false, worldMat)
             gl.uniform1i(_uniforms.fillType, 0)
             gl.uniform4fv(_uniforms.color, _WHITE)
-            for (const mv of group.maskVaos) {
-                gl.bindVertexArray(mv.vao)
-                gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
+            if (group.maskBatchVao) {
+                gl.bindVertexArray(group.maskBatchVao.vao)
+                gl.drawArrays(gl.TRIANGLES, 0, group.maskBatchVao.vertexCount)
             }
             gl.colorMask(true, true, true, true)
             stencilDepth--
@@ -895,11 +963,13 @@ const viewport = {
                 if (item.isGroup) {
                     const group = item.group
                     if (group.type === 'plain') {
-                        for (const entry of group.vaos) drawEntry(entry, worldMat)
+                        drawSolidBatch(group.solidVao, worldMat)
+                        for (const entry of group.gradVaos) drawGradEntry(entry, worldMat)
                     } else {
                         const maskedKids = maskedByGroup.get(group.maskId) ?? []
                         pushMask(group, worldMat)
-                        for (const cv of group.contentVaos) drawEntry(cv, worldMat)
+                        drawSolidBatch(group.solidVao, worldMat)
+                        for (const entry of group.gradVaos) drawGradEntry(entry, worldMat)
                         for (const kid of maskedKids) {
                             const kidMat = composeMat3(worldMat, instanceLocalMat(kid, frame, isDragging, dragInstanceId))
                             drawInstTree(kid, kidMat)
@@ -934,22 +1004,20 @@ const viewport = {
                 if (_hoverHighlight.maskId != null) {
                     // Highlight just the mask shape for this mask group
                     const group = groups?.find(g => g.type === 'masked' && g.maskId === _hoverHighlight.maskId)
-                    if (group) {
+                    if (group?.maskBatchVao) {
                         gl.uniform4fv(_uniforms.color, _HIGHLIGHT_MASK)
-                        for (const mv of group.maskVaos) {
-                            gl.bindVertexArray(mv.vao)
-                            gl.drawArrays(gl.TRIANGLES, 0, mv.vertexCount)
-                        }
+                        gl.bindVertexArray(group.maskBatchVao.vao)
+                        gl.drawArrays(gl.TRIANGLES, 0, group.maskBatchVao.vertexCount)
                     }
                 } else {
                     // Highlight all geometry for this instance's symbol
                     gl.uniform4fv(_uniforms.color, _HIGHLIGHT_INST)
                     if (groups) {
                         for (const group of groups) {
-                            const vaos = group.type === 'plain'
-                                ? group.vaos
-                                : [...group.maskVaos, ...group.contentVaos]
-                            for (const v of vaos) {
+                            // solidVao has stride-24 but fillType=0 only reads position from attrib 0 — OK
+                            const drawables = [group.solidVao, group.maskBatchVao, ...(group.gradVaos ?? [])]
+                            for (const v of drawables) {
+                                if (!v) continue
                                 gl.bindVertexArray(v.vao)
                                 gl.drawArrays(gl.TRIANGLES, 0, v.vertexCount)
                             }
@@ -1104,7 +1172,7 @@ const viewport = {
 
     _renderClear() {
         gl.viewport(0, 0, canvas.width, canvas.height)
-        const [r, g, b] = cssVarToGL('--bg-base')
+        const [r, g, b] = _clearColor
         gl.clearColor(r, g, b, 1.0)
         gl.clearStencil(0)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT)
@@ -1133,7 +1201,8 @@ const viewport = {
     },
 
     init() {
-        _prog     = createProgram(gl, VERT_SCENE, FRAG_SCENE)
+        _clearColor = cssVarToGL('--bg-base')
+        _prog       = createProgram(gl, VERT_SCENE, FRAG_SCENE)
         _uniforms = {
             viewMatrix:  gl.getUniformLocation(_prog, 'uViewMatrix'),
             modelMatrix: gl.getUniformLocation(_prog, 'uModelMatrix'),

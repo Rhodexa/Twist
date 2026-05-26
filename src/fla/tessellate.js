@@ -1,43 +1,65 @@
 // Tessellate FLA fill regions into triangle meshes for WebGL.
 // Pipeline: segments → closed contours (chain-stitched) → earcut triangulation.
-// Quadratic bezier curves are subdivided into line segments before tessellation.
+// Bezier curves are subdivided adaptively based on geometric flatness.
 
 import earcut from '../../node_modules/earcut/src/earcut.js'
 
-const BEZIER_STEPS = 8   // segments per quadratic bezier curve
-const STITCH_EPS   = 0.05 // px — endpoint matching tolerance
-const MAX_STOPS    = 16   // Flash gradient stop limit
+// Flatness thresholds for adaptive bezier subdivision (world-space pixels).
+// A bezier is split only when its control-point deviates from the chord midpoint
+// by more than this value. Smaller = smoother curves = more vertices.
+export const QUALITY_VIEWPORT = 0.5   // ~half-pixel, fast interactive display
+export const QUALITY_RENDER   = 0.15  // ~quarter-pixel, final / export quality
+
+const STITCH_EPS  = 0.05  // px — endpoint matching tolerance
+const MAX_STOPS   = 16    // Flash gradient stop limit
+const MITER_LIMIT = 4.0
+const CAP_STEPS   = 8
 
 // ── Bezier subdivision ─────────────────────────────────────────────────────
+// Recursive midpoint halving. Only splits when the control-point distance from
+// the chord midpoint exceeds `f2` (flatness², avoids a sqrt). Depth cap of 8
+// (max 256 output points per bezier) prevents blowup on degenerate inputs.
+// Flash artwork is full of near-straight beziers — the common path emits a
+// single endpoint immediately, making this far cheaper than fixed-step loops.
 
-function subdivideBezier(x0, y0, cx, cy, x1, y1, steps, out) {
-    for (let i = 1; i <= steps; i++) {
-        const t  = i / steps
-        const mt = 1 - t
-        out.push(mt*mt*x0 + 2*mt*t*cx + t*t*x1)
-        out.push(mt*mt*y0 + 2*mt*t*cy + t*t*y1)
+function _subdiv(x0, y0, cx, cy, x1, y1, f2, out, d) {
+    const mx = (x0 + x1) * 0.5
+    const my = (y0 + y1) * 0.5
+    const dx = cx - mx
+    const dy = cy - my
+    if (d < 8 && dx * dx + dy * dy > f2) {
+        const lx = (x0 + cx) * 0.5, ly = (y0 + cy) * 0.5
+        const rx = (cx + x1) * 0.5, ry = (cy + y1) * 0.5
+        const hx = (lx + rx) * 0.5, hy = (ly + ry) * 0.5
+        _subdiv(x0, y0, lx, ly, hx, hy, f2, out, d + 1)
+        _subdiv(hx, hy, rx, ry, x1, y1, f2, out, d + 1)
+    } else {
+        out.push(x1, y1)
     }
 }
 
 // ── Contour stitching ──────────────────────────────────────────────────────
-// Port of Python's _segs_to_svg_d, but produces flat [x,y,...] point arrays.
 
-function segStartXY(seg) { return [seg[0].x, seg[0].y] }
-function segEndXY(seg) {
-    const c = seg[seg.length - 1]
-    return c.type === 'Q' ? [c.x, c.y] : [c.x, c.y]
+// Numeric key from (x, y) — avoids string allocation on every endpoint lookup.
+// KSCALE = 1 / STITCH_EPS = 20; coordinates are rounded to eps-sized buckets.
+// KCOL must exceed 2 × max(|round(coord × KSCALE)|).
+// Flash world coords typically fit in ±50 000 units → max ix ≈ ±1 000 000.
+// Using a prime KCOL prevents collisions: ix1*KCOL+iy1 ≠ ix2*KCOL+iy2 when
+// |iy| < KCOL/2, which holds since 1 000 000 < 2 000 003 / 2 = 1 000 001.
+const _KSCALE  = 1 / STITCH_EPS          // 20
+const _KCOL    = 2_000_003               // prime, main stitch eps
+const _KSCALE2 = _KSCALE * 0.5          // 10  (= 1 / mergeEps)
+const _KCOL2   = 1_000_003              // prime, merge eps (2× stitch eps)
+
+function _key(x, y) {
+    return Math.round(x * _KSCALE) * _KCOL + Math.round(y * _KSCALE)
+}
+function _key2(x, y) {
+    return Math.round(x * _KSCALE2) * _KCOL2 + Math.round(y * _KSCALE2)
 }
 
-function close(ax, ay, bx, by, eps) {
-    return Math.abs(ax - bx) <= eps && Math.abs(ay - by) <= eps
-}
-
-function stitchKey(x, y, eps) {
-    return `${Math.round(x / eps)},${Math.round(y / eps)}`
-}
-
-// Convert a chain of segments to a flat [x,y,...] point array, subdividing beziers.
-function chainToPoints(chain, segs) {
+// Convert a chain of seg indices to a flat [x,y,...] point array.
+function _chainToPoints(chain, segs, f2) {
     const pts = []
     for (let k = 0; k < chain.length; k++) {
         const seg = segs[chain[k]]
@@ -48,74 +70,112 @@ function chainToPoints(chain, segs) {
             const py = pts[pts.length - 1]
             if (c.type === 'L') {
                 pts.push(c.x, c.y)
-            } else if (c.type === 'Q') {
-                subdivideBezier(px, py, c.cx, c.cy, c.x, c.y, BEZIER_STEPS, pts)
+            } else {
+                _subdiv(px, py, c.cx, c.cy, c.x, c.y, f2, pts, 0)
             }
         }
     }
     return pts
 }
 
-function stitchContours(segs) {
+function stitchContours(segs, f2) {
     if (!segs.length) return []
 
-    // Build start-point index: key → [seg indices]
+    // Build start-point index: numeric key → [seg indices].
     const startIdx = new Map()
     for (let i = 0; i < segs.length; i++) {
-        const k = stitchKey(...segStartXY(segs[i]), STITCH_EPS)
-        if (!startIdx.has(k)) startIdx.set(k, [])
-        startIdx.get(k).push(i)
+        const s0 = segs[i][0]
+        const k  = _key(s0.x, s0.y)
+        let bucket = startIdx.get(k)
+        if (!bucket) { bucket = []; startIdx.set(k, bucket) }
+        bucket.push(i)
     }
 
-    const visited = new Set()
+    // Uint8Array is cache-friendly and avoids Set object overhead.
+    const visited = new Uint8Array(segs.length)
     const chains  = []
 
-    // Phase 1: greedy chain building
+    // Phase 1: greedy forward chain building (O(n) average via hash map).
     for (let seed = 0; seed < segs.length; seed++) {
-        if (visited.has(seed)) continue
+        if (visited[seed]) continue
         const chain = [seed]
-        visited.add(seed)
+        visited[seed] = 1
 
-        while (true) {
-            const [ex, ey] = segEndXY(segs[chain[chain.length - 1]])
-            const [sx, sy] = segStartXY(segs[chain[0]])
-            if (chain.length > 1 && close(ex, ey, sx, sy, STITCH_EPS)) break
-            const cands = (startIdx.get(stitchKey(ex, ey, STITCH_EPS)) || [])
-                .filter(i => !visited.has(i))
-            if (!cands.length) break
-            visited.add(cands[0])
-            chain.push(cands[0])
+        for (;;) {
+            const lastSeg = segs[chain[chain.length - 1]]
+            const lc      = lastSeg[lastSeg.length - 1]
+            const ex = lc.x, ey = lc.y
+
+            const fstSeg = segs[chain[0]]
+            const sx = fstSeg[0].x, sy = fstSeg[0].y
+            if (chain.length > 1 &&
+                Math.abs(ex - sx) <= STITCH_EPS &&
+                Math.abs(ey - sy) <= STITCH_EPS) break
+
+            const bucket = startIdx.get(_key(ex, ey))
+            if (!bucket) break
+            let next = -1
+            for (let b = 0; b < bucket.length; b++) {
+                if (!visited[bucket[b]]) { next = bucket[b]; break }
+            }
+            if (next === -1) break
+            visited[next] = 1
+            chain.push(next)
         }
         chains.push(chain)
     }
 
-    // Phase 2: merge open chains (handles degenerate gap-patch segments)
+    // Phase 2: merge open chains using an end-point lookup map.
+    // Each merge step is O(1) — no nested loop scanning.
     const mergeEps = STITCH_EPS * 2
-    for (let pass = 0; pass < chains.length; pass++) {
-        let merged = false
-        const open = chains.map((ch, i) => i).filter(i => chains[i].length > 0)
-        for (const i of open) {
-            const chi = chains[i]
-            const [eix, eiy] = segEndXY(segs[chi[chi.length - 1]])
-            const [six, siy] = segStartXY(segs[chi[0]])
-            if (close(eix, eiy, six, siy, mergeEps)) continue  // already closed
-            for (const j of open) {
-                if (j === i) continue
-                const chj = chains[j]
-                const [sjx, sjy] = segStartXY(segs[chj[0]])
-                if (close(eix, eiy, sjx, sjy, mergeEps)) {
-                    chains[i] = [...chi, ...chj]
-                    chains[j] = []
-                    merged = true
-                    break
-                }
-            }
-            if (merged) break
-        }
-        if (!merged) break
+    const endMap   = new Map()  // endKey → chain index
+
+    for (let i = 0; i < chains.length; i++) {
+        const ch = chains[i]
+        const ls = segs[ch[ch.length - 1]]
+        const lc = ls[ls.length - 1]
+        const fs = segs[ch[0]]
+        if (Math.abs(lc.x - fs[0].x) > mergeEps || Math.abs(lc.y - fs[0].y) > mergeEps)
+            endMap.set(_key2(lc.x, lc.y), i)
     }
 
-    return chains.filter(c => c.length > 0).map(chain => chainToPoints(chain, segs))
+    let changed = true
+    while (changed) {
+        changed = false
+        for (let i = 0; i < chains.length; i++) {
+            if (!chains[i].length) continue
+            const chi  = chains[i]
+            const fsi  = segs[chi[0]]
+            const sx   = fsi[0].x, sy = fsi[0].y
+            const lsi  = segs[chi[chi.length - 1]]
+            const lci  = lsi[lsi.length - 1]
+            if (Math.abs(lci.x - sx) <= mergeEps && Math.abs(lci.y - sy) <= mergeEps) continue
+
+            const j = endMap.get(_key2(sx, sy))
+            if (j === undefined || j === i || !chains[j].length) continue
+
+            const chj = chains[j]
+            const lsj = segs[chj[chj.length - 1]]
+            const lcj = lsj[lsj.length - 1]
+
+            endMap.delete(_key2(lcj.x, lcj.y))  // j's old end
+            endMap.delete(_key2(lci.x, lci.y))  // i's end (being absorbed)
+
+            for (let k = 0; k < chi.length; k++) chj.push(chi[k])
+            chains[i] = []
+
+            // j's new end is i's old end — re-register if still open.
+            const fsj = segs[chj[0]]
+            if (Math.abs(lci.x - fsj[0].x) > mergeEps || Math.abs(lci.y - fsj[0].y) > mergeEps)
+                endMap.set(_key2(lci.x, lci.y), j)
+
+            changed = true
+        }
+    }
+
+    return chains
+        .filter(c => c.length > 0)
+        .map(chain => _chainToPoints(chain, segs, f2))
 }
 
 // ── Earcut tessellation ────────────────────────────────────────────────────
@@ -166,11 +226,11 @@ function tessellateContours(contours) {
         .sort((a, b) => b.absArea - a.absArea)
 
     const allTris = []
-    const used    = new Array(byArea.length).fill(false)
+    const used    = new Uint8Array(byArea.length)
 
     for (let i = 0; i < byArea.length; i++) {
         if (used[i]) continue
-        used[i] = true
+        used[i] = 1
         const outerPts = byArea[i].pts
 
         const holes = []
@@ -178,15 +238,15 @@ function tessellateContours(contours) {
             if (used[j]) continue
             if (pointInPolygon(byArea[j].pts[0], byArea[j].pts[1], outerPts)) {
                 holes.push(byArea[j].pts)
-                used[j] = true
+                used[j] = 1
             }
         }
 
-        const verts      = [...outerPts]
+        const verts      = outerPts.slice()
         const holeStarts = []
         for (const h of holes) {
             holeStarts.push(verts.length / 2)
-            for (const v of h) verts.push(v)
+            for (let k = 0; k < h.length; k++) verts.push(h[k])
         }
 
         const idx = earcut(verts, holeStarts.length ? holeStarts : null, 2)
@@ -233,15 +293,16 @@ function packGradientStops(stops) {
 
 // Input:  [{ type:'fill'|'stroke', fill?:{type,color?,stops?,matrix?}, color?, segs, width? }]
 // Output: [{ fillType, color?, stopCount?, stopOffsets?, stopColors?, gradientMatInv?, vertices }]
-function tessellateAll(regions) {
+function tessellateAll(regions, flatness = QUALITY_RENDER) {
+    const f2     = flatness * flatness
     const meshes = []
     for (const r of regions) {
         let verts
         if (r.type === 'fill') {
-            const contours = stitchContours(r.segs)
+            const contours = stitchContours(r.segs, f2)
             verts = contours.length ? tessellateContours(contours) : null
         } else {
-            verts = tessellateStroke(r.segs, r.width)
+            verts = tessellateStroke(r.segs, r.width, f2)
         }
         if (!verts || verts.length < 6) continue
 
@@ -270,15 +331,15 @@ function tessellateAll(regions) {
 // Tessellate an array of render groups (as produced by collectDirectRegions).
 // Input:  [{ type:'plain'|'masked', regions?, maskRegions?, contentRegions? }]
 // Output: [{ type:'plain', meshes } | { type:'masked', maskMeshes, contentMeshes }]
-function tessellateGroups(groups) {
+function tessellateGroups(groups, flatness = QUALITY_RENDER) {
     const result = []
     for (const g of groups) {
         if (g.type === 'plain') {
-            const meshes = tessellateAll(g.regions)
+            const meshes = tessellateAll(g.regions, flatness)
             if (meshes.length) result.push({ type: 'plain', meshes, order: g.order ?? 0 })
         } else {
-            const maskMeshes    = tessellateAll(g.maskRegions)
-            const contentMeshes = tessellateAll(g.contentRegions)
+            const maskMeshes    = tessellateAll(g.maskRegions, flatness)
+            const contentMeshes = tessellateAll(g.contentRegions, flatness)
             if (maskMeshes.length)  // keep even when contentMeshes is empty — hierarchy children provide content
                 result.push({ type: 'masked', maskMeshes, contentMeshes, maskLayerIdx: g.maskLayerIdx, order: g.order ?? 0 })
         }
@@ -290,14 +351,14 @@ function tessellateGroups(groups) {
 // Input:  flat regions array [{ type, fill?, color?, segs, ... }]
 // Output: [{ color: [r,g,b,a], vertices: Float32Array }]
 function extractEdgeContours(regions) {
+    const f2     = QUALITY_VIEWPORT * QUALITY_VIEWPORT
     const result = []
     for (const r of regions) {
         if (r.type !== 'fill') continue
-        // Use solid fill colour; for gradients use the first stop as a stand-in.
         const color = r.fill?.type === 'solid'
             ? r.fill.color
             : (r.fill?.stops?.[0]?.color ?? [0.5, 0.5, 0.5, 1.0])
-        const contours = stitchContours(r.segs)
+        const contours = stitchContours(r.segs, f2)
         for (const pts of contours) {
             if (pts.length >= 4) result.push({ color, vertices: new Float32Array(pts) })
         }
@@ -305,11 +366,7 @@ function extractEdgeContours(regions) {
     return result
 }
 
-// ── Stroke tessellation ───────────────────────────────────────────────────
-// (unchanged from previous implementation)
-
-const MITER_LIMIT = 4.0
-const CAP_STEPS   = 8
+// ── Stroke tessellation ────────────────────────────────────────────────────
 
 function addRoundCap(tris, cx, cy, nx, ny, capDx, capDy, halfWidth) {
     for (let k = 0; k < CAP_STEPS; k++) {
@@ -410,10 +467,10 @@ function isClosedPolyline(pts) {
     return dx*dx + dy*dy <= STITCH_EPS * STITCH_EPS * 4
 }
 
-function tessellateStroke(segs, widthPx) {
-    const hw = widthPx / 2
-    const chains = stitchContours(segs)
-    const tris = []
+function tessellateStroke(segs, widthPx, f2) {
+    const hw     = widthPx / 2
+    const chains = stitchContours(segs, f2)
+    const tris   = []
     for (const pts of chains) {
         const closed = isClosedPolyline(pts)
         for (const v of expandPolyline(pts, hw, closed)) tris.push(v)

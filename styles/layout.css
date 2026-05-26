@@ -34,7 +34,7 @@ body {
 #panel-left {
     background:     var(--bg-panel);
     overflow:       hidden;
-    min-width:      120px;
+    min-width:      80px;
     display:        flex;
     flex-direction: column;
 }
@@ -241,3 +241,51 @@ body {
 }
 
 .ct-detail-mask { color: var(--accent); }
+
+/* ── Stats overlay ───────────────────────────────────────────────────────── */
+
+#stats-overlay {
+    position:      absolute;
+    left:          5px;
+    top:           30px;
+    min-width:     80px;
+    border-radius: var(--radius);
+    font:          10px/1.8 var(--font-mono);
+    pointer-events: none;
+    user-select:   none;
+    z-index:       10;
+}
+
+.stats-section {
+    font-size:      9px;
+    font-weight:    600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color:          rgba(255, 255, 255, 0.1);
+    margin-top:     4px;
+    margin-bottom:  1px;
+}
+.stats-section:first-child { margin-top: 0; }
+
+.stats-sep {
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    margin:     4px 0;
+}
+
+.stats-row {
+    display:         flex;
+    justify-content: space-between;
+    gap:             16px;
+}
+
+.stats-key {
+    color: rgba(255, 255, 255, 0.38);
+}
+.stats-key-dim {
+    color: rgba(255, 255, 255, 0.22);
+}
+
+.stats-val {
+    color:                  rgba(255, 255, 255, 0.75);
+    font-variant-numeric:   tabular-nums;
+}

@@ -6,32 +6,44 @@ const VERT_PASSE = /* glsl */`#version 300 es
 precision highp float;
 layout(location = 0) in vec2 aPosition;
 out vec2 vLocalPos;
+out vec4 vVertColor;
 void main() {
     vLocalPos   = aPosition;
+    vVertColor  = vec4(0.0);
     gl_Position = vec4(aPosition, 0.0, 1.0);
 }
 `
 
-// Scene vertex shader — emits vLocalPos so the fragment shader can sample gradients.
+// Scene vertex shader — emits vLocalPos (for gradient sampling) and vVertColor
+// (for batched solid fills where per-vertex RGBA is stored in the VBO).
 const VERT_SCENE = /* glsl */`#version 300 es
 precision highp float;
 
 layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec4 aColor;     // per-vertex RGBA; only read when uFillType == 3
 
 uniform mat3 uViewMatrix;    // viewport: world → NDC  (once per frame)
 uniform mat3 uModelMatrix;   // instance: local → world (once per draw call)
 
 out vec2 vLocalPos;
+out vec4 vVertColor;
 
 void main() {
     vLocalPos   = aPosition;
+    vVertColor  = aColor;
     vec3 world  = uModelMatrix * vec3(aPosition, 1.0);
     vec3 clip   = uViewMatrix  * world;
     gl_Position = vec4(clip.xy, 0.0, 1.0);
 }
 `
 
-// Scene fragment shader — solid fills (uFillType=0) and linear/radial gradients (1/2).
+// Scene fragment shader.
+//
+// uFillType:
+//   0 = solid uniform colour (uColor)              — masks, highlights, legacy
+//   1 = linear gradient                            — Flash LinearGradient
+//   2 = radial gradient                            — Flash RadialGradient
+//   3 = vertex colour (vVertColor)                 — batched solid fills
 //
 // Gradient coordinate system (Flash):
 //   LinearGradient: x runs −819.2 → +819.2 along the gradient axis at y=0.
@@ -43,9 +55,10 @@ const FRAG_SCENE = /* glsl */`#version 300 es
 precision highp float;
 
 in vec2 vLocalPos;
+in vec4 vVertColor;
 
-uniform int   uFillType;           // 0=solid, 1=linear, 2=radial
-uniform vec4  uColor;              // solid fill colour
+uniform int   uFillType;           // 0=solid uniform, 1=linear, 2=radial, 3=vertex colour
+uniform vec4  uColor;              // used when uFillType == 0
 uniform mat3  uGradMatInv;         // symbol-local → gradient space
 uniform int   uStopCount;
 uniform float uStopOffsets[16];
@@ -71,14 +84,14 @@ vec4 sampleGradient(float t) {
 void main() {
     if (uFillType == 0) {
         fragColor = uColor;
+    } else if (uFillType == 3) {
+        fragColor = vVertColor;
     } else {
         vec3  gpos = uGradMatInv * vec3(vLocalPos, 1.0);
         float t;
         if (uFillType == 1) {
-            // Linear: x from −819.2 to +819.2
             t = (gpos.x + 819.2) / 1638.4;
         } else {
-            // Radial: distance from origin / 819.2
             t = length(gpos.xy) / 819.2;
         }
         fragColor = sampleGradient(t);

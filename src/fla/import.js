@@ -17,7 +17,7 @@
 // Scrub cost: O(instances) tree traversal + matrix keyframe lookup — no XML.
 
 import { buildSymbolMap, parseHierarchy, collectDirectRegions } from './parser.js'
-import { tessellateGroups, extractEdgeContours }                            from './tessellate.js'
+import { tessellateGroups, extractEdgeContours, QUALITY_VIEWPORT } from './tessellate.js'
 import scene    from '../scene/scene.js'
 import viewport from '../ui/viewport.js'
 
@@ -65,7 +65,7 @@ function _registerSymbol(uid, name, groups) {
 function _ensureGpu(uid) {
     const sym = _symbolObjs.get(uid)
     if (!sym || sym.renderGroups) return sym
-    const tessGroups = tessellateGroups(sym._groups)
+    const tessGroups = tessellateGroups(sym._groups, QUALITY_VIEWPORT)
     for (const g of tessGroups) {
         if (g.type !== 'masked') continue
         const src = sym._groups.find(sg => sg.type === 'masked' && sg.maskLayerIdx === g.maskLayerIdx)
@@ -415,23 +415,56 @@ function _applyFrame(frameNum, resetView = false) {
     }
 
     // Sync scene — only visible instances and their required symbols.
+    const prevSymIds = new Set(scene.symbols.map(s => s.id))
     scene.symbols.length   = 0
     scene.instances.length = 0
 
+    const addedSymIds = new Set()
     for (const inst of _instances) {
         if (!visibleIds.has(inst.id)) continue
         const sym = _symbolObjs.get(inst.symbolId)
-        if (sym && !scene.symbols.some(s => s.id === sym.id)) {
+        if (sym && !addedSymIds.has(sym.id)) {
+            addedSymIds.add(sym.id)
             scene.symbols.push(sym)
             viewport.buildSymbolVaos(sym.id)
         }
         scene.instances.push(inst)
     }
 
+    // Evict GPU resources for symbols that left this frame — prevents VRAM accumulation
+    // across symbolName@@childFrame variants as the scrubber advances.
+    for (const oldId of prevSymIds) {
+        if (!addedSymIds.has(oldId)) viewport.deleteSymbolVaos(oldId)
+    }
+
     scene.timeline.currentFrame = frameNum
     if (resetView) viewport.fitCamera()
     viewport.markDirty()
     document.dispatchEvent(new CustomEvent('twist:sceneChanged'))
+}
+
+// ── Background pre-tessellation ───────────────────────────────────────────
+// Tessellates every registered symbol in idle batches so that scrubbing to any
+// frame is a cache hit rather than a blocking tessellation call.
+// Runs after the first frame is applied; the UI stays responsive because each
+// batch yields back to the event loop via setTimeout(0).
+
+const _PRETESS_BATCH = 8  // symbols per idle chunk
+
+function _preTessellate() {
+    const uids = [..._symbolObjs.keys()]
+    let i = 0
+    const total = uids.length
+    function next() {
+        const end = Math.min(i + _PRETESS_BATCH, total)
+        for (; i < end; i++) _ensureGpu(uids[i])
+        if (i < total) {
+            setTimeout(next, 0)
+        } else {
+            console.log(`[fla import] pre-tessellation done — ${total} symbols`)
+        }
+    }
+    setTimeout(next, 0)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -491,6 +524,11 @@ async function importFla() {
     _applyFrame(0, true)
 
     document.dispatchEvent(new CustomEvent('twist:flaImported', { detail: { frameCount } }))
+
+    // Pre-tessellate all registered symbols in background so scrubbing is always
+    // a cache hit. Batched via setTimeout(0) so the UI stays responsive.
+    // Frame 0 is already tessellated by _applyFrame above; the rest follow.
+    _preTessellate()
 }
 
 function scrubToFrame(frameNum) {
