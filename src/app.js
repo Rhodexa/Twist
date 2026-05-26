@@ -10,6 +10,7 @@ import { initCompositor }        from './ui/compositor.js'
 import { initStats }             from './ui/stats.js'
 import                                 './input/input.js'   // registers Ctrl+Z / Y / S
 import { init as initTransformTool }  from './tools/transform-tool.js'
+import { toProject, fromProject }     from './scene/serialize.js'
 
 // ── Startup ───────────────────────────────────────────────────────────────
 
@@ -31,26 +32,36 @@ document.addEventListener('keydown', e => {
             viewport.fitCamera()
             break
 
-        // O — open a .fla file and dump its structure to the console (debug)
+        // O — open project (Ctrl+O) or FLA debug dump (plain O)
         case 'o':
         case 'O':
-            window.twist.openFla().then(result => {
-                if (!result) return
-                if (result.error) { console.error('[fla] open failed:', result.error); return }
-                console.log('[fla] path:', result.path)
-                console.log('[fla] entries (%d total):', result.entries.length, result.entries)
-                console.log('[fla] library symbols (%d):', result.libEntries.length, result.libEntries)
-                if (result.dom) {
-                    console.log('[fla] DOMDocument.xml (first 4000 chars):\n', result.dom.slice(0, 4000))
-                }
-                if (result.libXmls) {
-                    const keys = Object.keys(result.libXmls)
-                    console.log('[fla] library XMLs loaded:', keys.length)
-                    for (const k of keys.slice(0, 3)) {
-                        console.log(`\n[fla] ${k} (first 2000 chars):\n`, result.libXmls[k].slice(0, 2000))
+            if (e.ctrlKey || e.metaKey) {
+                e.preventDefault()
+                window.twist.openProject().then(result => {
+                    if (!result) return
+                    if (result.error) { console.error('[project] open failed:', result.error); return }
+                    console.log('[project] opened:', result.path)
+                    fromProject(result.project)
+                })
+            } else {
+                window.twist.openFla().then(result => {
+                    if (!result) return
+                    if (result.error) { console.error('[fla] open failed:', result.error); return }
+                    console.log('[fla] path:', result.path)
+                    console.log('[fla] entries (%d total):', result.entries.length, result.entries)
+                    console.log('[fla] library symbols (%d):', result.libEntries.length, result.libEntries)
+                    if (result.dom) {
+                        console.log('[fla] DOMDocument.xml (first 4000 chars):\n', result.dom.slice(0, 4000))
                     }
-                }
-            })
+                    if (result.libXmls) {
+                        const keys = Object.keys(result.libXmls)
+                        console.log('[fla] library XMLs loaded:', keys.length)
+                        for (const k of keys.slice(0, 3)) {
+                            console.log(`\n[fla] ${k} (first 2000 chars):\n`, result.libXmls[k].slice(0, 2000))
+                        }
+                    }
+                })
+            }
             break
 
         // I — import a .fla file into the scene
@@ -63,6 +74,22 @@ document.addEventListener('keydown', e => {
         case 'Enter':
             e.preventDefault()
             togglePlay()
+            break
+
+        // P — load mock project (dev only)
+        case 'p':
+        case 'P':
+            fetch('./samples/simple-scene.twist/project.json')
+                .then(r => r.json())
+                .then(async proj => {
+                    const symbols = []
+                    for (const id of (proj.library ?? [])) {
+                        const sym = await fetch(`./samples/simple-scene.twist/library/${id}.json`).then(r => r.json())
+                        symbols.push(sym)
+                    }
+                    fromProject({ ...proj, symbols })
+                })
+                .catch(err => console.error('[mock] load failed:', err))
             break
 
         // K — set keyframe for the selected instance at the current frame
@@ -211,7 +238,13 @@ document.addEventListener('twist:flaImported', e => {
 // ── Save (Ctrl+S) ─────────────────────────────────────────────────────────
 
 document.addEventListener('twist:save', () => {
-    console.log('[twist] save — not yet implemented')
+    const projectData = toProject(scene)
+    window.twist.saveProject(projectData).then(result => {
+        if (!result) return
+        if (result.error) { console.error('[project] save failed:', result.error); return }
+        console.log('[project] saved to:', result.path)
+        document.title = `Twist — ${result.path.split(/[\\/]/).pop()}`
+    })
 })
 
 // ── Title reflects unsaved changes ────────────────────────────────────────

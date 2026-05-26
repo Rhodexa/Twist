@@ -88,5 +88,109 @@ ipcMain.handle('fla:open', async () => {
     return { path: filePaths[0], magic, entries, dom, libEntries, libXmls }
 })
 
+// ── Twist project open ────────────────────────────────────────────────────
+// Reads a .twist folder: project.json + all library/*.json files.
+// Returns an assembled TwistProject object to the renderer.
+
+ipcMain.handle('twist:openProject', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+        title:      'Open Twist Project',
+        properties: ['openDirectory'],
+        buttonLabel: 'Open',
+    })
+    if (canceled || !filePaths.length) return null
+
+    const projectDir = filePaths[0]
+    const projectFile = path.join(projectDir, 'project.json')
+
+    if (!fs.existsSync(projectFile)) {
+        return { error: `Not a Twist project — no project.json found in: ${projectDir}` }
+    }
+
+    let project
+    try {
+        project = JSON.parse(fs.readFileSync(projectFile, 'utf8'))
+    } catch (err) {
+        return { error: `Failed to parse project.json: ${err.message}` }
+    }
+
+    // Read each library symbol file and replace the ID list with full objects.
+    const libraryDir = path.join(projectDir, 'library')
+    const symbols    = []
+
+    for (const symId of (project.library ?? [])) {
+        const symFile = path.join(libraryDir, `${symId}.json`)
+        try {
+            const sym = JSON.parse(fs.readFileSync(symFile, 'utf8'))
+            symbols.push(sym)
+        } catch (err) {
+            console.warn(`[twist:openProject] could not read symbol ${symId}: ${err.message}`)
+        }
+    }
+
+    // Assemble the final project object the renderer expects.
+    const assembled = {
+        version:  project.version,
+        name:     project.name,
+        camera:   project.camera,
+        timeline: project.timeline,
+        symbols,
+        stage:    project.stage,
+    }
+
+    return { project: assembled, path: projectDir }
+})
+
+// ── Twist project save ────────────────────────────────────────────────────
+// Writes a .twist folder: project.json + library/*.json per symbol.
+// Accepts the assembled TwistProject object from the renderer.
+
+ipcMain.handle('twist:saveProject', async (_, projectData, suggestedPath) => {
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+        title:       'Save Twist Project',
+        defaultPath: suggestedPath || path.join(app.getPath('documents'), 'untitled.twist'),
+        buttonLabel: 'Save',
+    })
+    if (canceled || !filePath) return null
+
+    try {
+        // filePath is the chosen folder path (with or without .twist extension).
+        const projectDir = filePath.endsWith('.twist') ? filePath : filePath + '.twist'
+        const libraryDir = path.join(projectDir, 'library')
+
+        fs.mkdirSync(libraryDir, { recursive: true })
+
+        const libIds = (projectData.symbols ?? []).map(s => s.id)
+
+        // Write each symbol to its own file.
+        for (const sym of (projectData.symbols ?? [])) {
+            fs.writeFileSync(
+                path.join(libraryDir, `${sym.id}.json`),
+                JSON.stringify(sym, null, 2),
+                'utf8'
+            )
+        }
+
+        // Write project.json (without inlined symbols — use ID list instead).
+        const projectJson = {
+            version:  projectData.version,
+            name:     projectData.name,
+            camera:   projectData.camera,
+            timeline: projectData.timeline,
+            library:  libIds,
+            stage:    projectData.stage,
+        }
+        fs.writeFileSync(
+            path.join(projectDir, 'project.json'),
+            JSON.stringify(projectJson, null, 2),
+            'utf8'
+        )
+
+        return { path: projectDir }
+    } catch (err) {
+        return { error: `Save failed: ${err.message}` }
+    }
+})
+
 // No macOS handling — Twist targets Linux and Windows only.
 app.on('window-all-closed', () => app.quit())

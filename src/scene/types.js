@@ -18,7 +18,7 @@
  */
 
 /**
- * @typedef {{ x: number[], y: number[], rotation: number[], scaleX: number[], scaleY: number[] }} TrackSet
+ * @typedef {{ x: Keyframe[], y: Keyframe[], rotation: Keyframe[], scaleX: Keyframe[], scaleY: Keyframe[] }} TrackSet
  * Each property track is an array of Keyframe objects, sorted by frame.
  */
 
@@ -70,21 +70,28 @@
  *   edgeContours: EdgeContour[],
  *   renderGroups: RenderGroup[]|null,
  * }} TwistSymbol
- * Geometry container. renderGroups is null until first display.
+ * Runtime geometry container. renderGroups is null until first display.
+ * _groups holds bezier paths for the current active frame.
  */
 
 /**
  * @typedef {{
- *   id:        string,
- *   symbolId:  string,
- *   label:     string,
- *   parentId:  string|null,
- *   order:     number,
- *   rawMatrix: AffineMatrix|null,
- *   maskId:    string|null,
- *   transform: Transform,
- *   tracks:    TrackSet,
+ *   id:           string,
+ *   symbolId:     string,
+ *   label:        string,
+ *   parentId:     string|null,
+ *   order:        number,
+ *   rawMatrix:    AffineMatrix|null,
+ *   maskId:       string|null,
+ *   frameIn:      number,
+ *   frameOut:     number,
+ *   loop:         'loop'|'play once'|'single frame',
+ *   firstFrame:   number,
+ *   transform:    Transform,
+ *   tracks:       TrackSet,
+ *   _matrixTrack: {frame:number, mat:AffineMatrix}[],
  * }} TwistInstance
+ * Runtime instance. rawMatrix / _matrixTrack carry FLA-imported animation.
  */
 
 /**
@@ -106,6 +113,86 @@
  * }} TwistTimeline
  */
 
+// ── Project-format typedefs ───────────────────────────────────────────────
+// These describe the on-disk / serialized format, not the runtime objects.
+
+/**
+ * @typedef {{
+ *   symbolRef:  string,
+ *   matrix:     AffineMatrix,
+ *   loop:       'loop'|'play once'|'single frame',
+ *   firstFrame: number,
+ *   label?:     string,
+ *   maskId?:    string,
+ *   order?:     number,
+ *   id?:        string,
+ * }} TwistElement
+ * A child symbol placement inside a symbol keyframe span.
+ * Equivalent to Flash's DOMSymbolInstance on a layer.
+ */
+
+/**
+ * @typedef {{
+ *   index:     number,
+ *   duration:  number,
+ *   groups:    BezierGroup[],
+ *   elements:  TwistElement[],
+ * }} TwistSymbolKeyframe
+ * One keyframe span on a symbol layer — holds geometry AND child placements.
+ */
+
+/**
+ * @typedef {{
+ *   name:            string,
+ *   type:            'normal'|'mask'|'guide',
+ *   parentLayerIndex: number|null,
+ *   keyframes:       TwistSymbolKeyframe[],
+ * }} TwistSymbolLayer
+ */
+
+/**
+ * @typedef {{
+ *   id:       string,
+ *   name:     string,
+ *   label:    string,
+ *   timeline: { duration:number, layers:TwistSymbolLayer[] },
+ * }} TwistProjectSymbol
+ * On-disk symbol definition. No tessellated data — geometry is bezier paths only.
+ */
+
+/**
+ * @typedef {{
+ *   id:          string,
+ *   symbolRef:   string,
+ *   label:       string,
+ *   parentId:    string|null,
+ *   order:       number,
+ *   maskId:      string|null,
+ *   frameIn:     number,
+ *   frameOut:    number,
+ *   loop:        'loop'|'play once'|'single frame',
+ *   firstFrame:  number,
+ *   matrix:      AffineMatrix,
+ *   tracks:      TrackSet,
+ *   matrixTrack: {frame:number, mat:AffineMatrix}[],
+ * }} TwistSceneInstance
+ * On-disk instance. Uses AffineMatrix (lossless) instead of TRS.
+ */
+
+/**
+ * @typedef {{
+ *   version:  string,
+ *   name:     string,
+ *   camera:   TwistCamera,
+ *   timeline: { duration:number, fps:number },
+ *   symbols:  TwistProjectSymbol[],
+ *   stage:    { instances: TwistSceneInstance[] },
+ * }} TwistProject
+ * Root on-disk document. Assembled by main.js from project.json + library/*.json.
+ */
+
+// ── Runtime document (legacy, kept for reference) ─────────────────────────
+
 /**
  * @typedef {{
  *   version:   string,
@@ -114,6 +201,8 @@
  *   symbols:   TwistSymbol[],
  *   instances: TwistInstance[],
  * }} TwistDocument
+ * @deprecated Use TwistProject. This flat runtime-snapshot format is kept
+ * for backward compatibility with old serialize.js toJSON/fromJSON.
  */
 
 // ── Factories ─────────────────────────────────────────────────────────────
@@ -126,12 +215,17 @@ function makeSymbol({ id, name, label, _groups = [], edgeContours = [], renderGr
 /** @returns {TwistInstance} */
 function makeInstance({
     id, symbolId, label,
-    parentId  = null,
-    order     = 0,
-    rawMatrix = null,
-    maskId    = null,
-    transform = {},
-    tracks    = {},
+    parentId    = null,
+    order       = 0,
+    rawMatrix   = null,
+    maskId      = null,
+    frameIn     = 0,
+    frameOut    = Infinity,
+    loop        = 'loop',
+    firstFrame  = 0,
+    transform   = {},
+    tracks      = {},
+    _matrixTrack = [],
 } = {}) {
     return {
         id, symbolId, label,
@@ -139,8 +233,13 @@ function makeInstance({
         order,
         rawMatrix,
         maskId,
+        frameIn,
+        frameOut,
+        loop,
+        firstFrame,
         transform: { x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1, ...transform },
         tracks:    { x: [], y: [], rotation: [], scaleX: [], scaleY: [], ...tracks },
+        _matrixTrack,
     }
 }
 

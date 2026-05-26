@@ -5,9 +5,9 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('twist', {
     platform: process.platform,
 
-    // File I/O — stubs until save/load is wired in main.js
-    saveFile: (filePath, data) => ipcRenderer.invoke('file:save', filePath, data),
-    openFile: (filePath)       => ipcRenderer.invoke('file:open', filePath),
+    // Twist project I/O
+    openProject: ()                    => ipcRenderer.invoke('twist:openProject'),
+    saveProject: (projectData, suggestedPath) => ipcRenderer.invoke('twist:saveProject', projectData, suggestedPath),
 
     // FLA import
     openFla: () => ipcRenderer.invoke('fla:open'),

@@ -1,144 +1,139 @@
-// Twist document serialization — TwistDocument ↔ JSON.
+// Twist document serialization — scene ↔ TwistProject JSON.
+//
+// toProject(scene)   — serialize current runtime scene to project format
+// fromProject(data)  — thin alias: calls loader.loadProject (kept here for
+//                      import symmetry — the heavy lifting is in loader.js)
 //
 // Serialized format stores:
-//   camera, timeline, instances, and symbol bezier-path geometry (_groups).
+//   camera, timeline, symbols (bezier-path geometry only), stage instances.
 //
-// NOT serialized (reconstructed at load time):
+// NOT serialized (reconstructed at load):
 //   renderGroups  — tessellated on first display
 //   edgeContours  — re-derived from _groups
-//
-// This keeps the file format geometry-resolution-independent: you can load
-// a .twist file and tessellate at whatever quality you need.
 
-import { extractEdgeContours } from '../fla/tessellate.js'
+import { loadProject } from './loader.js'
 
 const FORMAT_VERSION = '0.1'
 
-// ── Serialize ─────────────────────────────────────────────────────────────
+// ── Symbol decompose helpers ───────────────────────────────────────────────
 
-function serializeSymbol(sym) {
+// Runtime sym._groups is a flat BezierGroup[] for the active frame.
+// When saving, we wrap it in a single-keyframe timeline so the project
+// format is forward-compatible with multi-frame symbols.
+function _wrapGroupsAsTimeline(groups) {
     return {
-        id:     sym.id,
-        name:   sym.name,
-        label:  sym.label,
-        groups: sym._groups,   // bezier paths — plain JSON, no Float32Arrays
+        duration: 1,
+        layers: [
+            {
+                name:             'shape',
+                type:             'normal',
+                parentLayerIndex: null,
+                keyframes: [
+                    {
+                        index:    0,
+                        duration: 1,
+                        groups:   groups,
+                        elements: [],
+                    }
+                ],
+            }
+        ],
     }
 }
 
-function serializeInstance(inst) {
+// ── Instance decompose helpers ─────────────────────────────────────────────
+
+// Derive affine matrix from runtime transform (lossy only for skew, but
+// runtime already carries rawMatrix if skew was present on import).
+function _instanceToMatrix(inst) {
+    if (inst.rawMatrix) return [...inst.rawMatrix]
+    const { x, y, rotation, scaleX, scaleY } = inst.transform
+    const cos = Math.cos(rotation)
+    const sin = Math.sin(rotation)
+    return [scaleX * cos, scaleX * sin, -scaleY * sin, scaleY * cos, x, y]
+}
+
+// ── Serialize ─────────────────────────────────────────────────────────────
+
+function _serializeSymbol(sym) {
     return {
-        id:        inst.id,
-        symbolId:  inst.symbolId,
-        label:     inst.label,
-        parentId:  inst.parentId,
-        order:     inst.order,
-        rawMatrix: inst.rawMatrix,
-        maskId:    inst.maskId,
-        transform: { ...inst.transform },
-        tracks:    {
-            x:        inst.tracks.x.map(kf => ({ ...kf })),
-            y:        inst.tracks.y.map(kf => ({ ...kf })),
-            rotation: inst.tracks.rotation.map(kf => ({ ...kf })),
-            scaleX:   inst.tracks.scaleX.map(kf => ({ ...kf })),
-            scaleY:   inst.tracks.scaleY.map(kf => ({ ...kf })),
+        id:       sym.id,
+        name:     sym.name,
+        label:    sym.label,
+        timeline: _wrapGroupsAsTimeline(sym._groups ?? []),
+    }
+}
+
+function _serializeInstance(inst) {
+    return {
+        id:          inst.id,
+        symbolRef:   inst.symbolId,
+        label:       inst.label,
+        parentId:    inst.parentId  ?? null,
+        order:       inst.order     ?? 0,
+        maskId:      inst.maskId    ?? null,
+        frameIn:     inst.frameIn   ?? 0,
+        frameOut:    inst.frameOut  === Infinity ? null : (inst.frameOut ?? null),
+        loop:        inst.loop      ?? 'loop',
+        firstFrame:  inst.firstFrame ?? 0,
+        matrix:      _instanceToMatrix(inst),
+        tracks: {
+            x:        (inst.tracks?.x        ?? []).map(kf => ({ ...kf })),
+            y:        (inst.tracks?.y        ?? []).map(kf => ({ ...kf })),
+            rotation: (inst.tracks?.rotation ?? []).map(kf => ({ ...kf })),
+            scaleX:   (inst.tracks?.scaleX   ?? []).map(kf => ({ ...kf })),
+            scaleY:   (inst.tracks?.scaleY   ?? []).map(kf => ({ ...kf })),
         },
+        matrixTrack: (inst._matrixTrack ?? []).map(kf => ({ ...kf, mat: [...kf.mat] })),
     }
 }
 
 /**
- * Serialize the live scene to a plain JSON-safe object.
- * Pass the result to JSON.stringify to write a .twist file.
+ * Serialize the live scene to a TwistProject object.
+ * Pass to JSON.stringify (or main.js saveProject IPC) to write a .twist folder.
+ *
+ * Note: for FLA-imported scenes this saves a snapshot — symbol geometry is
+ * the current frame's _groups only, and _matrixTrack is preserved for reload.
+ * Full multi-frame symbol fidelity requires the FLA importer refactor.
+ *
  * @param {import('./scene.js').default} scene
- * @returns {import('./types.js').TwistDocument}
+ * @returns {import('./types.js').TwistProject}
  */
-function toJSON(scene) {
+function toProject(scene) {
+    // Only serialize root-level instances (no parentId) as stage instances.
+    // Children are encoded inside their parent symbol's elements — but since
+    // the current runtime model holds children as flat scene.instances, we
+    // serialise ALL instances here and let the loader rebuild parentId links.
     return {
-        version:   FORMAT_VERSION,
-        camera:    { ...scene.camera, output: { ...scene.camera.output } },
-        timeline:  {
+        version:  FORMAT_VERSION,
+        name:     document.title.replace(/^Twist — /, '').replace(/ •$/, '') || 'untitled',
+        camera: {
+            x:      scene.camera.x,
+            y:      scene.camera.y,
+            width:  scene.camera.width,
+            height: scene.camera.height,
+            output: { ...scene.camera.output },
+        },
+        timeline: {
             duration: scene.timeline.duration,
             fps:      scene.timeline.fps,
         },
-        symbols:   scene.symbols.map(serializeSymbol),
-        instances: scene.instances.map(serializeInstance),
-    }
-}
-
-// ── Deserialize ───────────────────────────────────────────────────────────
-
-function deserializeSymbol(data) {
-    const groups = data.groups ?? []
-
-    // Re-derive edgeContours from the stored bezier paths.
-    const allRegions = groups.flatMap(g =>
-        g.type === 'plain'
-            ? g.regions
-            : [...(g.maskRegions ?? []), ...(g.contentRegions ?? [])]
-    )
-
-    return {
-        id:           data.id,
-        name:         data.name,
-        label:        data.label,
-        _groups:      groups,
-        edgeContours: extractEdgeContours(allRegions),
-        renderGroups: null,   // tessellated on first display
-    }
-}
-
-function deserializeInstance(data) {
-    return {
-        id:        data.id,
-        symbolId:  data.symbolId,
-        label:     data.label ?? '',
-        parentId:  data.parentId ?? null,
-        order:     data.order ?? 0,
-        rawMatrix: data.rawMatrix ?? null,
-        maskId:    data.maskId ?? null,
-        transform: {
-            x: 0, y: 0, rotation: 0, scaleX: 1, scaleY: 1,
-            ...data.transform,
-        },
-        tracks: {
-            x:        data.tracks?.x        ?? [],
-            y:        data.tracks?.y        ?? [],
-            rotation: data.tracks?.rotation ?? [],
-            scaleX:   data.tracks?.scaleX   ?? [],
-            scaleY:   data.tracks?.scaleY   ?? [],
-        },
+        symbols: scene.symbols.map(_serializeSymbol),
+        stage:   { instances: scene.instances.map(_serializeInstance) },
     }
 }
 
 /**
- * Restore a scene from a deserialized .twist JSON object.
- * Populates scene.symbols, scene.instances, scene.camera, and scene.timeline.
- * Does NOT tessellate — that happens on first display.
- * @param {object} data — parsed JSON (from JSON.parse)
- * @param {import('./scene.js').default} scene
+ * Load a TwistProject into the scene.
+ * Delegates to loader.js — kept here for import symmetry.
+ * @param {object} data — parsed TwistProject JSON
  */
-function fromJSON(data, scene) {
-    if (!data?.version) throw new Error('[twist] missing version field')
-
-    const cam = data.camera ?? {}
-    scene.camera.x      = cam.x      ?? scene.camera.x
-    scene.camera.y      = cam.y      ?? scene.camera.y
-    scene.camera.width  = cam.width  ?? scene.camera.width
-    scene.camera.height = cam.height ?? scene.camera.height
-    if (cam.output) {
-        scene.camera.output.w = cam.output.w ?? scene.camera.output.w
-        scene.camera.output.h = cam.output.h ?? scene.camera.output.h
-    }
-
-    const tl = data.timeline ?? {}
-    scene.timeline.duration     = tl.duration ?? scene.timeline.duration
-    scene.timeline.fps          = tl.fps      ?? scene.timeline.fps
-    scene.timeline.currentFrame = 0
-    scene.timeline.playing      = false
-
-    scene.symbols.length   = 0
-    scene.instances.length = 0
-    for (const s of data.symbols   ?? []) scene.symbols.push(deserializeSymbol(s))
-    for (const i of data.instances ?? []) scene.instances.push(deserializeInstance(i))
+function fromProject(data) {
+    loadProject(data)
 }
 
-export { toJSON, fromJSON }
+// ── Legacy flat serializer (kept for reference) ───────────────────────────
+// The old toJSON/fromJSON used a flat runtime snapshot. Replaced by
+// toProject/fromProject. Remove once fully migrated.
+
+export { toProject, fromProject }
