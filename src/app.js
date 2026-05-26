@@ -4,9 +4,8 @@ import journal                    from './journal/journal.js'
 import scene                      from './scene/scene.js'
 import viewport                   from './ui/viewport.js'
 import { initTimelineUI, togglePlay } from './ui/timeline-ui.js'
-import { importFla, scrubToFrame } from './fla/import.js'
+import { importFla } from './fla/import.js'
 import { initOutliner }          from './ui/outliner.js'
-import { initCompositor }        from './ui/compositor.js'
 import { initStats }             from './ui/stats.js'
 import                                 './input/input.js'   // registers Ctrl+Z / Y / S
 import { init as initTransformTool }  from './tools/transform-tool.js'
@@ -17,7 +16,6 @@ import { toProject, fromProject }     from './scene/serialize.js'
 viewport.init()
 initTimelineUI()
 initOutliner()
-initCompositor()
 initTransformTool()    // G / R / S modal transform tool
 initStats()            // backtick to toggle
 
@@ -133,107 +131,6 @@ document.addEventListener('keydown', e => {
     }
 })
 
-// ── FLA frame scrubber ────────────────────────────────────────────────────
-// Lives between the viewport and the timeline panel. Created on first import,
-// updated if a new file is opened. Hidden when frameCount === 1.
-
-let _scrubberEl   = null
-let _flaPlaying   = false
-let _flaPlayRaf   = null
-let _flaFrame     = 0
-let _flaFrameCount = 0
-let _flaLastTime  = 0
-
-function _flaPlayTick(now) {
-    if (!_flaPlaying) return
-    const elapsed = now - _flaLastTime
-    if (elapsed >= 1000 / 24) {   // ~24 fps scrub playback
-        _flaLastTime = now
-        _flaFrame = (_flaFrame + 1) % _flaFrameCount
-        _flaPlayUpdate(_flaFrame)
-    }
-    _flaPlayRaf = requestAnimationFrame(_flaPlayTick)
-}
-
-function _flaPlayUpdate(f) {
-    const slider  = _scrubberEl?.querySelector('input[type=range]')
-    const counter = _scrubberEl?.querySelector('.fla-counter')
-    if (slider)  slider.value     = f
-    if (counter) counter.textContent = `${f} / ${_flaFrameCount - 1}`
-    scrubToFrame(f)
-}
-
-function _flaTogglePlay(playBtn) {
-    _flaPlaying = !_flaPlaying
-    playBtn.textContent = _flaPlaying ? '⏹' : '▶'
-    if (_flaPlaying) {
-        _flaLastTime = performance.now()
-        _flaPlayRaf  = requestAnimationFrame(_flaPlayTick)
-    } else {
-        cancelAnimationFrame(_flaPlayRaf)
-    }
-}
-
-document.addEventListener('twist:flaImported', e => {
-    const { frameCount } = e.detail
-    const panelCenter   = document.getElementById('panel-center')
-    const timelinePanel = document.getElementById('timeline-panel')
-
-    // Stop any running playback from a previous file
-    _flaPlaying = false
-    cancelAnimationFrame(_flaPlayRaf)
-    if (_scrubberEl) { _scrubberEl.remove(); _scrubberEl = null }
-    if (frameCount <= 1) return
-
-    _flaFrame      = 0
-    _flaFrameCount = frameCount
-
-    _scrubberEl = document.createElement('div')
-    _scrubberEl.id = 'fla-scrubber-bar'
-    _scrubberEl.style.cssText = [
-        'display:flex', 'align-items:center', 'gap:12px',
-        'padding:6px 14px', 'flex-shrink:0',
-        'background:var(--bg-panel,#181818)',
-        'border-top:1px solid var(--border,rgba(255,255,255,0.08))',
-        'border-bottom:1px solid var(--border,rgba(255,255,255,0.08))',
-        'font:12px/1 monospace', 'color:rgba(255,255,255,0.55)',
-        'user-select:none',
-    ].join(';')
-
-    const tag = document.createElement('span')
-    tag.textContent = 'FLA'
-    tag.style.cssText = 'font-size:10px;font-weight:bold;letter-spacing:.06em;color:rgba(255,255,255,0.3)'
-
-    const playBtn = document.createElement('button')
-    playBtn.textContent = '▶'
-    playBtn.style.cssText = [
-        'background:rgba(255,255,255,0.08)', 'border:1px solid rgba(255,255,255,0.15)',
-        'color:#fff', 'font-size:11px', 'padding:2px 8px', 'border-radius:4px',
-        'cursor:pointer', 'flex-shrink:0',
-    ].join(';')
-    playBtn.addEventListener('click', () => _flaTogglePlay(playBtn))
-
-    const slider = document.createElement('input')
-    slider.type  = 'range'
-    slider.min   = '0'
-    slider.max   = String(frameCount - 1)
-    slider.value = '0'
-    slider.style.cssText = 'flex:1;height:16px;cursor:pointer;accent-color:#c89fff'
-
-    const counter = document.createElement('span')
-    counter.className = 'fla-counter'
-    counter.style.cssText = 'font-variant-numeric:tabular-nums;color:#fff;min-width:52px;text-align:right'
-    counter.textContent = `0 / ${frameCount - 1}`
-
-    slider.addEventListener('input', () => {
-        _flaFrame = parseInt(slider.value)
-        counter.textContent = `${_flaFrame} / ${frameCount - 1}`
-        scrubToFrame(_flaFrame)
-    })
-
-    _scrubberEl.append(tag, playBtn, slider, counter)
-    panelCenter.insertBefore(_scrubberEl, timelinePanel)
-})
 
 // ── Save (Ctrl+S) ─────────────────────────────────────────────────────────
 

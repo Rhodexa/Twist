@@ -9,35 +9,17 @@ body {
 
 #app {
     display:               grid;
-    grid-template-columns: var(--left-panel-w, 260px) 4px 1fr 280px;
-    grid-template-rows:    1fr;   /* fill the flex space, not a hard 100vh */
-    flex:                  1;     /* take all remaining body height */
-    min-height:            0;     /* allow grid to shrink below content size */
+    grid-template-columns: 1fr 280px;
+    grid-template-rows:    1fr;
+    flex:                  1;
+    min-height:            0;
     width:                 100%;
-    gap:                   0;
+    gap:                   1px;
     background:            var(--border);
 }
 
-/* Resize handle between left panel and centre */
-#resize-handle-left {
-    grid-column:    2;
-    background:     var(--border);
-    cursor:         col-resize;
-    transition:     background 0.1s;
-    z-index:        5;
-}
-#resize-handle-left:hover,
-#resize-handle-left.dragging { background: var(--accent); }
-
-/* ── Left panel (compositor) ────────────────────────────────────────────── */
-
-#panel-left {
-    background:     var(--bg-panel);
-    overflow:       hidden;
-    min-width:      80px;
-    display:        flex;
-    flex-direction: column;
-}
+#panel-left,
+#resize-handle-left { display: none; }
 
 /* ── Centre column (viewport + timeline) ────────────────────────────────── */
 
@@ -104,10 +86,11 @@ body {
     min-width:   28px;
 }
 
-.tl-scrub {
-    flex:   1;
-    cursor: pointer;
-    accent-color: var(--accent);
+.tl-fps {
+    font-family: var(--font-mono);
+    font-size:   11px;
+    color:       var(--text-disabled);
+    margin-left: auto;
 }
 
 /* ── Right panel (outliner) ──────────────────────────────────────────────── */
@@ -173,74 +156,6 @@ body {
 .panel {
     background: var(--bg-panel);
 }
-
-/* ── Compositor tree panel ───────────────────────────────────────────────── */
-
-.ct-header {
-    padding:        6px 10px;
-    font-size:      11px;
-    font-weight:    600;
-    color:          var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    border-top:     1px solid var(--border);
-    border-bottom:  1px solid var(--border);
-    flex-shrink:    0;
-}
-
-#compositor-tree {
-    overflow-y: auto;
-    overflow-x: hidden;
-    min-height: 80px;
-    height: 100%
-}
-
-.ct-body {
-    padding-left: 14px;
-}
-
-.ct-row {
-    display:     flex;
-    align-items: center;
-    height:      20px;
-    padding:     0 4px;
-    gap:         4px;
-    font:        11px/1 var(--font-mono);
-    white-space: nowrap;
-    overflow:    hidden;
-}
-
-.ct-inst {
-    color:  var(--text-primary);
-    cursor: pointer;
-}
-.ct-inst:hover { background: var(--bg-hover); }
-
-.ct-group-plain  { color: var(--text-secondary); }
-.ct-group-masked { color: var(--accent); }
-.ct-warn         { color: var(--color-warning); }
-
-.ct-icon {
-    width:       12px;
-    flex-shrink: 0;
-    text-align:  center;
-    font-size:   9px;
-    opacity:     0.8;
-}
-
-.ct-label {
-    flex:          1;
-    overflow:      hidden;
-    text-overflow: ellipsis;
-}
-
-.ct-detail {
-    font-size:   10px;
-    color:       var(--text-disabled);
-    flex-shrink: 0;
-}
-
-.ct-detail-mask { color: var(--accent); }
 
 /* ── Stats overlay ───────────────────────────────────────────────────────── */
 
