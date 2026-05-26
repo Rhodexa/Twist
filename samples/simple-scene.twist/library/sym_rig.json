@@ -1,0 +1,42 @@
+{
+  "id": "sym_rig",
+  "name": "rig",
+  "label": "rig",
+  "timeline": {
+    "duration": 1,
+    "layers": [
+      {
+        "name": "instances",
+        "type": "normal",
+        "parentLayerIndex": null,
+        "keyframes": [
+          {
+            "index": 0,
+            "duration": 1,
+            "groups": [],
+            "elements": [
+              {
+                "id":         "sym_rig_el0",
+                "symbolRef":  "sym_circle",
+                "matrix":     [1, 0, 0, 1, -200, 0],
+                "loop":       "loop",
+                "firstFrame": 0,
+                "label":      "circle",
+                "order":      1
+              },
+              {
+                "id":         "sym_rig_el1",
+                "symbolRef":  "sym_rect",
+                "matrix":     [1, 0, 0, 1,  200, 0],
+                "loop":       "loop",
+                "firstFrame": 0,
+                "label":      "rect",
+                "order":      2
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

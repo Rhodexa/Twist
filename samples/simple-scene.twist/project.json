@@ -1,0 +1,69 @@
+{
+  "version": "0.1",
+  "name": "Simple Scene",
+  "camera": {
+    "x": 0,
+    "y": 0,
+    "width": 1920,
+    "height": 1080,
+    "output": { "w": 1920, "h": 1080 }
+  },
+  "timeline": {
+    "fps": 24,
+    "duration": 48
+  },
+  "library": ["sym_circle", "sym_rect", "sym_rig"],
+  "stage": {
+    "instances": [
+      {
+        "id":          "inst_rig",
+        "symbolRef":   "sym_rig",
+        "label":       "rig",
+        "parentId":    null,
+        "order":       1,
+        "maskId":      null,
+        "frameIn":     0,
+        "frameOut":    null,
+        "loop":        "loop",
+        "firstFrame":  0,
+        "matrix":      [1, 0, 0, 1, 0, 0],
+        "tracks": {
+          "x":        [
+            { "frame":  0, "value":    0 },
+            { "frame": 24, "value":  600 },
+            { "frame": 48, "value":    0 }
+          ],
+          "y":        [],
+          "rotation": [],
+          "scaleX":   [],
+          "scaleY":   []
+        },
+        "matrixTrack": []
+      },
+      {
+        "id":          "inst_standalone",
+        "symbolRef":   "sym_circle",
+        "label":       "solo circle",
+        "parentId":    null,
+        "order":       2,
+        "maskId":      null,
+        "frameIn":     0,
+        "frameOut":    null,
+        "loop":        "loop",
+        "firstFrame":  0,
+        "matrix":      [1.5, 0, 0, 1.5, 700, -280],
+        "tracks": {
+          "x":        [],
+          "y":        [],
+          "rotation": [
+            { "frame":  0, "value": 0 },
+            { "frame": 48, "value": 3.141592654 }
+          ],
+          "scaleX":   [],
+          "scaleY":   []
+        },
+        "matrixTrack": []
+      }
+    ]
+  }
+}

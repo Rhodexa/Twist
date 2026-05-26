@@ -1,0 +1,42 @@
+{
+  "id": "sym_rect",
+  "name": "shapes/rect",
+  "label": "rect",
+  "timeline": {
+    "duration": 1,
+    "layers": [
+      {
+        "name": "shape",
+        "type": "normal",
+        "parentLayerIndex": null,
+        "keyframes": [
+          {
+            "index": 0,
+            "duration": 1,
+            "groups": [
+              {
+                "type": "plain",
+                "order": 1,
+                "regions": [
+                  {
+                    "type": "fill",
+                    "fill": { "type": "solid", "color": [0.25, 0.5, 1.0, 1.0] },
+                    "segs": [
+                      [
+                        { "type": "M", "x": -120, "y":  -60 },
+                        { "type": "L", "x":  120, "y":  -60 },
+                        { "type": "L", "x":  120, "y":   60 },
+                        { "type": "L", "x": -120, "y":   60 }
+                      ]
+                    ]
+                  }
+                ]
+              }
+            ],
+            "elements": []
+          }
+        ]
+      }
+    ]
+  }
+}

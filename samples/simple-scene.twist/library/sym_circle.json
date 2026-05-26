@@ -1,0 +1,50 @@
+{
+  "id": "sym_circle",
+  "name": "shapes/circle",
+  "label": "circle",
+  "timeline": {
+    "duration": 1,
+    "layers": [
+      {
+        "name": "shape",
+        "type": "normal",
+        "parentLayerIndex": null,
+        "keyframes": [
+          {
+            "index": 0,
+            "duration": 1,
+            "groups": [
+              {
+                "type": "plain",
+                "order": 1,
+                "regions": [
+                  {
+                    "type": "fill",
+                    "fill": { "type": "solid", "color": [1.0, 0.55, 0.0, 1.0] },
+                    "segs": [
+                      [
+                        { "type": "M", "x":  100,    "y":    0   },
+                        { "type": "L", "x":  86.6,   "y":   50   },
+                        { "type": "L", "x":  50,     "y":   86.6 },
+                        { "type": "L", "x":   0,     "y":  100   },
+                        { "type": "L", "x":  -50,    "y":   86.6 },
+                        { "type": "L", "x":  -86.6,  "y":   50   },
+                        { "type": "L", "x": -100,    "y":    0   },
+                        { "type": "L", "x":  -86.6,  "y":  -50   },
+                        { "type": "L", "x":  -50,    "y":  -86.6 },
+                        { "type": "L", "x":    0,    "y": -100   },
+                        { "type": "L", "x":   50,    "y":  -86.6 },
+                        { "type": "L", "x":   86.6,  "y":  -50   }
+                      ]
+                    ]
+                  }
+                ]
+              }
+            ],
+            "elements": []
+          }
+        ]
+      }
+    ]
+  }
+}
