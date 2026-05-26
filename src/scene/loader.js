@@ -10,7 +10,7 @@
 
 import scene    from './scene.js'
 import viewport from '../ui/viewport.js'
-import { extractEdgeContours } from '../fla/tessellate.js'
+import { tessellateGroups, extractEdgeContours, QUALITY_VIEWPORT } from '../fla/tessellate.js'
 
 // ── Matrix helpers ────────────────────────────────────────────────────────
 
@@ -178,7 +178,7 @@ export function loadProject(projectData) {
             label:        symData.label,
             _groups:      groups,
             edgeContours: extractEdgeContours(allRegions),
-            renderGroups: null,   // tessellated on first display
+            renderGroups: tessellateGroups(groups, QUALITY_VIEWPORT),
         })
     }
 
